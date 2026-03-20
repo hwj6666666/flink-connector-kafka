@@ -26,9 +26,9 @@ under the License.
 
 # Dynamic Kafka SQL Connector
 
-{{< label "Scan Source: Unbounded" >}}
+{{< label "Scan Source: Unbounded" >}} {{< label "Sink: Streaming" >}}
 
-The Dynamic Kafka connector allows for reading data from Kafka topics that can move across
+The Dynamic Kafka connector allows reading from and writing to Kafka topics that can move across
 clusters without restarting the job. Streams are resolved via a Kafka metadata service. This is
 especially useful for cluster migrations and dynamic topic/cluster changes.
 
@@ -40,8 +40,8 @@ Dependencies
 The Kafka connector is not part of the binary distribution.
 See how to link with it for cluster execution [here]({{< ref "docs/dev/configuration/overview" >}}).
 
-How to create a Dynamic Kafka table
------------------------------------
+How to create a Dynamic Kafka source table
+------------------------------------------
 
 The example below shows how to create a Dynamic Kafka table using the built-in
 `single-cluster` metadata service. With this service, stream ids are interpreted as topics
@@ -71,6 +71,39 @@ service class must implement `KafkaMetadataService` and should either have a pub
 constructor or a constructor that accepts `Properties`. The connector will pass the Kafka
 properties (all `properties.*` options) into the constructor when available.
 
+How to create a Dynamic Kafka sink table
+----------------------------------------
+
+The sink uses the same logical stream abstraction. At write time, the connector resolves the stream
+to the current target cluster and topic and routes all outgoing records accordingly.
+
+```sql
+CREATE TABLE DynamicKafkaSinkTable (
+  `user_id` BIGINT,
+  `item_id` BIGINT,
+  `behavior` STRING
+) WITH (
+  'connector' = 'dynamic-kafka',
+  'stream-ids' = 'user_behavior_output',
+  'metadata-service' = 'single-cluster',
+  'metadata-service.cluster-id' = 'cluster-0',
+  'properties.bootstrap.servers' = 'localhost:9092',
+  'sink.delivery-guarantee' = 'at-least-once',
+  'format' = 'csv'
+);
+```
+
+The current sink implementation expects exactly one configured stream id and one active
+cluster/topic route at a time. If the metadata service returns an ambiguous multi-cluster or
+multi-topic mapping, the job fails fast.
+
+For a self-contained local demo, see the `dynamic-kafka-sink-demo/` directory in the repository.
+That directory contains:
+
+* `docker-compose.yml` for Kafka
+* `run.sh run` to prepare Kafka, refresh the local demo image if needed, and run the demo
+* `run.sh push` to manually rebuild the local demo image
+
 Available Metadata
 ------------------
 
@@ -79,6 +112,12 @@ dynamic-source-specific metadata column:
 
 * `kafka_cluster` (`STRING NOT NULL`, read-only): cluster id resolved by the metadata service for
   the record.
+
+For sinks, the connector currently supports writable Kafka metadata shared with the standard Kafka
+sink for:
+
+* `headers`
+* `timestamp`
 
 See [Kafka SQL Connector]({{< ref "docs/connectors/table/kafka" >}}#available-metadata) for the
 shared metadata columns.

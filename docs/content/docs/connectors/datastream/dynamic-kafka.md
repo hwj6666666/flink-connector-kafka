@@ -24,7 +24,7 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# Dynamic Kafka Source _`Experimental`_
+# Dynamic Kafka Source and Sink _`Experimental`_
 
 Flink provides an [Apache Kafka](https://kafka.apache.org) connector for reading data from Kafka topics from one or more Kafka clusters. 
 The Dynamic Kafka connector discovers the clusters and topics using a Kafka metadata service and can achieve reading in a dynamic fashion, facilitating changes in 
@@ -89,6 +89,49 @@ env.from_source(source, WatermarkStrategy.no_watermarks(), "Dynamic Kafka Source
 ```
 {{< /tab >}}
 {{< /tabs >}}
+
+## Dynamic Kafka Sink
+
+Dynamic Kafka Sink resolves a logical stream into the current physical Kafka cluster and topic at
+write time. The sink periodically refreshes the metadata service and switches the active writer when
+the stream mapping changes.
+
+The current implementation is intentionally conservative:
+
+* it expects exactly one logical stream to be configured for writing;
+* the resolved stream must point to exactly one active Kafka cluster and one topic at a time;
+* ambiguous multi-cluster or multi-topic mappings fail fast instead of silently broadcasting.
+
+Example:
+
+```java
+DynamicKafkaSink<String> sink =
+    DynamicKafkaSink.<String>builder()
+        .setStreamId("output-stream")
+        .setKafkaMetadataService(
+            new SingleClusterTopicMetadataService("cluster-a", properties))
+        .setRecordSerializer(
+            KafkaRecordSerializationSchema.<String>builder()
+                // The dynamic sink overrides the physical topic from metadata.
+                .setTopic("unused-by-dynamic-sink")
+                .setValueSerializationSchema(new SimpleStringSchema())
+                .build())
+        .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+        .setProperties(properties)
+        .build();
+
+env.fromData("alpha", "beta", "gamma").sinkTo(sink);
+```
+
+### Local Demo
+
+A standalone demo module is available in `dynamic-kafka-sink-demo/`. To prepare Kafka, refresh the
+local image when needed, and run the demo:
+
+```bash
+cd dynamic-kafka-sink-demo
+./run.sh run
+```
 The following properties are **required** for building a DynamicKafkaSource:
 
 The Kafka metadata service, configured by setKafkaMetadataService(KafkaMetadataService)
