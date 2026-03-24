@@ -1,7 +1,7 @@
 services:
   kafka:
     image: confluentinc/cp-kafka:7.9.2
-    container_name: ${COMPOSE_PROJECT_NAME:-dynamic-kafka-sink-demo}-kafka
+    container_name: ${COMPOSE_PROJECT_NAME:-flink-dynamic-kafka-sink}-kafka
     ports:
       - "9094:9094"
     environment:
