@@ -20,7 +20,7 @@
 package org.apache.flink.connector.kafka.sink.lineage;
 
 import org.apache.flink.annotation.PublicEvolving;
-import org.apache.flink.connector.kafka.dynamic.lineage.KafkaDatasetIdentifier;
+import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetIdentifier;
 
 import java.util.Objects;
 import java.util.Properties;

@@ -22,11 +22,11 @@ import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.api.java.typeutils.TypeExtractor;
 import org.apache.flink.connector.kafka.sink.lineage.DefaultKafkaDatasetFacet;
-import org.apache.flink.connector.kafka.dynamic.lineage.DefaultKafkaDatasetIdentifier;
+import org.apache.flink.connector.kafka.sink.lineage.DefaultKafkaDatasetIdentifier;
 import org.apache.flink.connector.kafka.sink.lineage.DefaultTypeDatasetFacet;
 import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetFacet;
 import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetFacetProvider;
-import org.apache.flink.connector.kafka.dynamic.lineage.KafkaDatasetIdentifierProvider;
+import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetIdentifierProvider;
 import org.apache.flink.connector.kafka.sink.lineage.TypeDatasetFacet;
 import org.apache.flink.connector.kafka.sink.lineage.TypeDatasetFacetProvider;
 

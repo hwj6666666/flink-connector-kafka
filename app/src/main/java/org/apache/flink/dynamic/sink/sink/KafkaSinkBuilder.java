@@ -20,8 +20,8 @@ package org.apache.flink.dynamic.sink.sink;
 
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.connector.base.DeliveryGuarantee;
-import org.apache.flink.connector.kafka.dynamic.metadata.SingleClusterTopicMetadataService;
-import org.apache.flink.connector.kafka.dynamic.sink.DynamicKafkaSink;
+import org.apache.flink.connector.kafka.metadata.SingleClusterTopicMetadataService;
+import org.apache.flink.connector.kafka.sink.DynamicKafkaSink;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 
 import org.apache.kafka.clients.producer.ProducerConfig;

@@ -17,7 +17,7 @@
  *
  */
 
-package org.apache.flink.connector.kafka.dynamic.lineage;
+package org.apache.flink.connector.kafka.sink.lineage;
 
 import org.apache.flink.annotation.PublicEvolving;
 

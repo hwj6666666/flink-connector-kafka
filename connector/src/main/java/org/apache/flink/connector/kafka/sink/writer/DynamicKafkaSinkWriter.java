@@ -16,20 +16,20 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.kafka.dynamic.sink.writer;
+package org.apache.flink.connector.kafka.sink.writer;
 
 import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.flink.connector.base.DeliveryGuarantee;
-import org.apache.flink.connector.kafka.dynamic.metadata.ClusterMetadata;
-import org.apache.flink.connector.kafka.dynamic.metadata.KafkaMetadataService;
-import org.apache.flink.connector.kafka.dynamic.metadata.KafkaStream;
-import org.apache.flink.connector.kafka.dynamic.sink.committer.DynamicKafkaCommittable;
-import org.apache.flink.connector.kafka.dynamic.sink.serializer.DynamicKafkaTargetAwareRecordSerializationSchema;
-import org.apache.flink.connector.kafka.dynamic.sink.state.DynamicKafkaSinkWriterState;
-import org.apache.flink.connector.kafka.dynamic.sink.subscriber.KafkaStreamSubscriber;
+import org.apache.flink.connector.kafka.metadata.ClusterMetadata;
+import org.apache.flink.connector.kafka.metadata.KafkaMetadataService;
+import org.apache.flink.connector.kafka.metadata.KafkaStream;
+import org.apache.flink.connector.kafka.sink.committer.DynamicKafkaCommittable;
+import org.apache.flink.connector.kafka.sink.serializer.DynamicKafkaTargetAwareRecordSerializationSchema;
+import org.apache.flink.connector.kafka.sink.state.DynamicKafkaSinkWriterState;
+import org.apache.flink.connector.kafka.sink.subscriber.KafkaStreamSubscriber;
 import org.apache.flink.connector.kafka.sink.lineage.DefaultKafkaDatasetFacet;
-import org.apache.flink.connector.kafka.dynamic.lineage.DefaultKafkaDatasetIdentifier;
+import org.apache.flink.connector.kafka.sink.lineage.DefaultKafkaDatasetIdentifier;
 import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetFacet;
 import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetFacetProvider;
 import org.apache.flink.connector.kafka.sink.lineage.TypeDatasetFacet;

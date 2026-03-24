@@ -2,8 +2,12 @@ package org.apache.flink.dynamic.sink.job;
 
 import org.apache.flink.dynamic.sink.sink.KafkaSinkBuilder;
 import org.apache.flink.dynamic.sink.util.ConfigUtil;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.connector.source.util.ratelimit.RateLimiterStrategy;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.connector.datagen.source.DataGeneratorSource;
+import org.apache.flink.connector.datagen.source.GeneratorFunction;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.source.legacy.SourceFunction;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -39,7 +43,10 @@ public class DynamicJob {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
 
-        env.addSource(new RandomCsvSource(intervalMs))
+        env.fromSource(
+                        createRandomCsvSource(intervalMs),
+                        WatermarkStrategy.noWatermarks(),
+                        "random-csv-source")
                 .sinkTo(
                         new KafkaSinkBuilder()
                                 .build(
@@ -52,31 +59,14 @@ public class DynamicJob {
         env.execute("Dynamic Sink Benchmark Job");
     }
 
-    private static final class RandomCsvSource implements SourceFunction<String> {
-        private final long intervalMs;
-        private volatile boolean running = true;
-
-        private RandomCsvSource(long intervalMs) {
-            this.intervalMs = intervalMs;
-        }
-
-        @Override
-        public void run(SourceContext<String> ctx) throws Exception {
-            ThreadLocalRandom random = ThreadLocalRandom.current();
-            while (running) {
-                synchronized (ctx.getCheckpointLock()) {
-                    ctx.collect(generateRecord(random));
-                }
-                if (intervalMs > 0) {
-                    Thread.sleep(intervalMs);
-                }
-            }
-        }
-
-        @Override
-        public void cancel() {
-            running = false;
-        }
+    private static DataGeneratorSource<String> createRandomCsvSource(long intervalMs) {
+        GeneratorFunction<Long, String> generator = ignored -> generateRecord(ThreadLocalRandom.current());
+        long recordsPerSecond = intervalMs <= 0 ? Long.MAX_VALUE : Math.max(1L, 1000L / intervalMs);
+        return new DataGeneratorSource<>(
+                generator,
+                Long.MAX_VALUE,
+                RateLimiterStrategy.perSecond(recordsPerSecond),
+                TypeInformation.of(String.class));
     }
 
     private static String generateRecord(ThreadLocalRandom random) {

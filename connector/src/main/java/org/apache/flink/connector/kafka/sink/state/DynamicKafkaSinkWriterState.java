@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.kafka.dynamic.sink.state;
+package org.apache.flink.connector.kafka.sink.state;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.connector.kafka.sink.KafkaWriterState;

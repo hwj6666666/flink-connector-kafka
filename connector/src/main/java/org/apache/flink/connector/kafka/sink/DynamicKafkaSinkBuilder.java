@@ -16,16 +16,14 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.kafka.dynamic.sink;
+package org.apache.flink.connector.kafka.sink;
 
 import org.apache.flink.annotation.Experimental;
 import org.apache.flink.connector.base.DeliveryGuarantee;
-import org.apache.flink.connector.kafka.dynamic.metadata.KafkaMetadataService;
-import org.apache.flink.connector.kafka.dynamic.sink.subscriber.KafkaStreamSetSubscriber;
-import org.apache.flink.connector.kafka.dynamic.sink.subscriber.KafkaStreamSubscriber;
-import org.apache.flink.connector.kafka.dynamic.sink.subscriber.StreamPatternSubscriber;
-import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
-import org.apache.flink.connector.kafka.sink.TransactionNamingStrategy;
+import org.apache.flink.connector.kafka.metadata.KafkaMetadataService;
+import org.apache.flink.connector.kafka.sink.subscriber.KafkaStreamSetSubscriber;
+import org.apache.flink.connector.kafka.sink.subscriber.KafkaStreamSubscriber;
+import org.apache.flink.connector.kafka.sink.subscriber.StreamPatternSubscriber;
 import org.apache.flink.util.Preconditions;
 
 import org.apache.commons.lang3.RandomStringUtils;
@@ -153,7 +151,7 @@ public class DynamicKafkaSinkBuilder<T> {
         if (transactionalIdPrefix != null) {
             return transactionalIdPrefix;
         }
-        return "DynamicKafkaSink-" + RandomStringUtils.randomAlphabetic(8);
+        return "DynamicKafkaSink-" + RandomStringUtils.secure().nextAlphabetic(8);
     }
 
     private void ensureSubscriberIsNull(String attemptingSubscribeMode) {

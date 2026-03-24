@@ -16,9 +16,9 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.kafka.dynamic.sink.serializer;
+package org.apache.flink.connector.kafka.sink.serializer;
 
-import org.apache.flink.connector.kafka.dynamic.sink.committer.DynamicKafkaCommittable;
+import org.apache.flink.connector.kafka.sink.committer.DynamicKafkaCommittable;
 import org.apache.flink.connector.kafka.sink.KafkaCommittable;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 

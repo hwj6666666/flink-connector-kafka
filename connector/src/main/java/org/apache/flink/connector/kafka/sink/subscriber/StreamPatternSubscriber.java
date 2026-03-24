@@ -16,11 +16,11 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.kafka.dynamic.sink.subscriber;
+package org.apache.flink.connector.kafka.sink.subscriber;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.connector.kafka.dynamic.metadata.KafkaMetadataService;
-import org.apache.flink.connector.kafka.dynamic.metadata.KafkaStream;
+import org.apache.flink.connector.kafka.metadata.KafkaMetadataService;
+import org.apache.flink.connector.kafka.metadata.KafkaStream;
 
 import java.util.ArrayList;
 import java.util.List;

@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.kafka.dynamic.metadata;
+package org.apache.flink.connector.kafka.metadata;
 
 import org.apache.flink.annotation.Experimental;
 

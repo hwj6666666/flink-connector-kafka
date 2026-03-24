@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.kafka.dynamic.sink.serializer;
+package org.apache.flink.connector.kafka.sink.serializer;
 
 import org.apache.flink.util.InstantiationUtil;
 

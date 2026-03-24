@@ -16,9 +16,9 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.kafka.dynamic.sink.state;
+package org.apache.flink.connector.kafka.sink.state;
 
-import org.apache.flink.connector.kafka.dynamic.sink.serializer.DynamicKafkaSinkSerializationUtils;
+import org.apache.flink.connector.kafka.sink.serializer.DynamicKafkaSinkSerializationUtils;
 import org.apache.flink.connector.kafka.sink.KafkaWriterState;
 import org.apache.flink.connector.kafka.sink.internal.CheckpointTransaction;
 import org.apache.flink.connector.kafka.sink.internal.TransactionOwnership;

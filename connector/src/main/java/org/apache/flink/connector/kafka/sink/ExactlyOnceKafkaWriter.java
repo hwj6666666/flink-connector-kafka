@@ -24,7 +24,7 @@ import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetFacet;
 import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetFacetProvider;
-import org.apache.flink.connector.kafka.dynamic.lineage.KafkaDatasetIdentifier;
+import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetIdentifier;
 import org.apache.flink.connector.kafka.sink.internal.BackchannelFactory;
 import org.apache.flink.connector.kafka.sink.internal.CheckpointTransaction;
 import org.apache.flink.connector.kafka.sink.internal.FlinkKafkaInternalProducer;

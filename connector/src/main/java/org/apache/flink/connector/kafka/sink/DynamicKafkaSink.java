@@ -16,25 +16,22 @@
  * limitations under the License.
  */
 
-package org.apache.flink.connector.kafka.dynamic.sink;
+package org.apache.flink.connector.kafka.sink;
 
 import org.apache.flink.annotation.Experimental;
 import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.api.connector.sink2.CommitterInitContext;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.flink.connector.base.DeliveryGuarantee;
-import org.apache.flink.connector.kafka.dynamic.metadata.KafkaMetadataService;
-import org.apache.flink.connector.kafka.dynamic.sink.committer.DynamicKafkaCommittable;
-import org.apache.flink.connector.kafka.dynamic.sink.committer.DynamicKafkaCommitter;
-import org.apache.flink.connector.kafka.dynamic.sink.config.DynamicKafkaSinkOptions;
-import org.apache.flink.connector.kafka.dynamic.sink.serializer.DynamicKafkaCommittableSerializer;
-import org.apache.flink.connector.kafka.dynamic.sink.state.DynamicKafkaSinkWriterState;
-import org.apache.flink.connector.kafka.dynamic.sink.state.DynamicKafkaSinkWriterStateSerializer;
-import org.apache.flink.connector.kafka.dynamic.sink.subscriber.KafkaStreamSubscriber;
-import org.apache.flink.connector.kafka.dynamic.sink.writer.DynamicKafkaSinkWriter;
-import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
-import org.apache.flink.connector.kafka.sink.TransactionNamingStrategy;
-import org.apache.flink.connector.kafka.sink.TwoPhaseCommittingStatefulSink;
+import org.apache.flink.connector.kafka.metadata.KafkaMetadataService;
+import org.apache.flink.connector.kafka.sink.committer.DynamicKafkaCommittable;
+import org.apache.flink.connector.kafka.sink.committer.DynamicKafkaCommitter;
+import org.apache.flink.connector.kafka.sink.config.DynamicKafkaSinkOptions;
+import org.apache.flink.connector.kafka.sink.serializer.DynamicKafkaCommittableSerializer;
+import org.apache.flink.connector.kafka.sink.state.DynamicKafkaSinkWriterState;
+import org.apache.flink.connector.kafka.sink.state.DynamicKafkaSinkWriterStateSerializer;
+import org.apache.flink.connector.kafka.sink.subscriber.KafkaStreamSubscriber;
+import org.apache.flink.connector.kafka.sink.writer.DynamicKafkaSinkWriter;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 
 import java.io.IOException;
