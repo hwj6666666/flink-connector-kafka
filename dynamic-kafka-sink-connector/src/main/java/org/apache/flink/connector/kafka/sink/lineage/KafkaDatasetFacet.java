@@ -17,19 +17,19 @@
  *
  */
 
-package org.apache.flink.connector.kafka.lineage;
+package org.apache.flink.connector.kafka.sink.lineage;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.streaming.api.lineage.LineageDatasetFacet;
 
-import java.util.Optional;
+import java.util.Properties;
 
-/** Contains method which allows extracting topic identifier. */
+/** Facet definition to contain all Kafka specific information on Kafka sources and sinks. */
 @PublicEvolving
-public interface KafkaDatasetIdentifierProvider {
+public interface KafkaDatasetFacet extends LineageDatasetFacet {
+    Properties getProperties();
 
-    /**
-     * Gets Kafka dataset identifier or empty in case a class implementing is not able to extract
-     * dataset identifier.
-     */
-    Optional<DefaultKafkaDatasetIdentifier> getDatasetIdentifier();
+    KafkaDatasetIdentifier getTopicIdentifier();
+
+    void setProperties(Properties properties);
 }

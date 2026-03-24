@@ -17,7 +17,7 @@
  *
  */
 
-package org.apache.flink.connector.kafka.lineage;
+package org.apache.flink.connector.kafka.sink.lineage;
 
 import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.streaming.api.lineage.LineageDataset;

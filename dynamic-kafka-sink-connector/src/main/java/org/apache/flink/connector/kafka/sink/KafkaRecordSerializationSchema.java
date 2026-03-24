@@ -29,9 +29,9 @@ import java.io.Serializable;
 
 /**
  * A serialization schema which defines how to convert a value of type {@code T} to {@link
- * ProducerRecord}. {@link org.apache.flink.connector.kafka.lineage.KafkaDatasetFacetProvider} can
+ * ProducerRecord}. {@link org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetFacetProvider} can
  * be implemented to provide Kafka specific lineage metadata, while {@link
- * org.apache.flink.connector.kafka.lineage.TypeDatasetFacetProvider} can be implemented to provide
+ * org.apache.flink.connector.kafka.sink.lineage.TypeDatasetFacetProvider} can be implemented to provide
  * lineage metadata with type information.
  *
  * @param <T> the type of values being serialized

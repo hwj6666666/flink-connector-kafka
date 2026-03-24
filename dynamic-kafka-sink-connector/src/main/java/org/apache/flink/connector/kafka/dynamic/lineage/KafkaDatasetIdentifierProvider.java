@@ -17,19 +17,19 @@
  *
  */
 
-package org.apache.flink.connector.kafka.lineage;
+package org.apache.flink.connector.kafka.dynamic.lineage;
 
 import org.apache.flink.annotation.PublicEvolving;
 
 import java.util.Optional;
 
-/** Contains method to extract {@link KafkaDatasetFacet}. */
+/** Contains method which allows extracting topic identifier. */
 @PublicEvolving
-public interface KafkaDatasetFacetProvider {
+public interface KafkaDatasetIdentifierProvider {
 
     /**
-     * Returns a Kafka dataset facet or empty in case an implementing class is not able to identify
-     * a dataset.
+     * Gets Kafka dataset identifier or empty in case a class implementing is not able to extract
+     * dataset identifier.
      */
-    Optional<KafkaDatasetFacet> getKafkaDatasetFacet();
+    Optional<DefaultKafkaDatasetIdentifier> getDatasetIdentifier();
 }

@@ -18,8 +18,8 @@
 
 package org.apache.flink.connector.kafka.source.enumerator.subscriber;
 
-import org.apache.flink.connector.kafka.lineage.DefaultKafkaDatasetIdentifier;
-import org.apache.flink.connector.kafka.lineage.KafkaDatasetIdentifierProvider;
+import org.apache.flink.connector.kafka.dynamic.lineage.DefaultKafkaDatasetIdentifier;
+import org.apache.flink.connector.kafka.dynamic.lineage.KafkaDatasetIdentifierProvider;
 
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.TopicDescription;

@@ -17,19 +17,14 @@
  *
  */
 
-package org.apache.flink.connector.kafka.lineage;
+package org.apache.flink.connector.kafka.sink.lineage;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.streaming.api.lineage.LineageDatasetFacet;
 
-import java.util.Optional;
-
-/** Contains method to extract {@link TypeDatasetFacet}. */
+/** Facet definition to contain type information of source and sink. */
 @PublicEvolving
-public interface TypeDatasetFacetProvider {
-
-    /**
-     * Returns a type dataset facet or `Optional.empty` in case an implementing class is not able to
-     * resolve type.
-     */
-    Optional<TypeDatasetFacet> getTypeDatasetFacet();
+public interface TypeDatasetFacet extends LineageDatasetFacet {
+    TypeInformation getTypeInformation();
 }

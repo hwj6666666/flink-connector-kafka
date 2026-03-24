@@ -41,7 +41,8 @@ import java.util.regex.Pattern;
  * three types of subscribing mode.
  *
  * <p>When implementing a subscriber, {@link
- * org.apache.flink.connector.kafka.lineage.KafkaDatasetIdentifierProvider} can be implemented to
+ * org.apache.flink.connector.kafka.dynamic.lineage.KafkaDatasetIdentifierProvider} can be
+ * implemented to
  * provide lineage metadata with source topics.
  */
 @PublicEvolving
