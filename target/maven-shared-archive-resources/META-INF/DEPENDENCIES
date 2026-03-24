@@ -1,0 +1,55 @@
+// ------------------------------------------------------------------
+// Transitive dependencies of this project determined from the
+// maven pom organized by organization.
+// ------------------------------------------------------------------
+
+Flink : Connectors : Kafka
+
+
+From: 'an unknown organization'
+  - LZ4 Java Compression (https://github.com/yawkat/lz4-java) at.yawk.lz4:lz4-java:jar:1.10.1
+    License: Apache License, Version 2.0  (https://www.apache.org/licenses/LICENSE-2.0)
+  - Apache Kafka (https://kafka.apache.org) org.apache.kafka:kafka-clients:jar:4.2.0
+    License: The Apache License, Version 2.0  (http://www.apache.org/licenses/LICENSE-2.0.txt)
+
+From: 'com.github.luben'
+  - zstd-jni (https://github.com/luben/zstd-jni) com.github.luben:zstd-jni:jar:1.5.6-10
+    License: BSD 2-Clause License  (https://opensource.org/licenses/BSD-2-Clause)
+
+From: 'FasterXML' (http://fasterxml.com/)
+  - Jackson-annotations (https://github.com/FasterXML/jackson) com.fasterxml.jackson.core:jackson-annotations:jar:2.18.2
+    License: The Apache Software License, Version 2.0  (https://www.apache.org/licenses/LICENSE-2.0.txt)
+  - Jackson-core (https://github.com/FasterXML/jackson-core) com.fasterxml.jackson.core:jackson-core:jar:2.18.2
+    License: The Apache Software License, Version 2.0  (https://www.apache.org/licenses/LICENSE-2.0.txt)
+  - jackson-databind (https://github.com/FasterXML/jackson) com.fasterxml.jackson.core:jackson-databind:jar:2.18.2
+    License: The Apache Software License, Version 2.0  (https://www.apache.org/licenses/LICENSE-2.0.txt)
+  - Jackson datatype: jdk8 (https://github.com/FasterXML/jackson-modules-java8/jackson-datatype-jdk8) com.fasterxml.jackson.datatype:jackson-datatype-jdk8:bundle:2.18.2
+    License: The Apache Software License, Version 2.0  (http://www.apache.org/licenses/LICENSE-2.0.txt)
+  - Jackson datatype: JSR310 (https://github.com/FasterXML/jackson-modules-java8/jackson-datatype-jsr310) com.fasterxml.jackson.datatype:jackson-datatype-jsr310:bundle:2.18.2
+    License: The Apache Software License, Version 2.0  (http://www.apache.org/licenses/LICENSE-2.0.txt)
+
+From: 'QOS.ch' (http://www.qos.ch)
+  - SLF4J API Module (http://www.slf4j.org) org.slf4j:slf4j-api:jar:1.7.36
+    License: MIT License  (http://www.opensource.org/licenses/mit-license.php)
+
+From: 'The Apache Software Foundation' (https://www.apache.org/)
+  - Apache Commons CLI (https://commons.apache.org/proper/commons-cli/) commons-cli:commons-cli:jar:1.9.0
+    License: Apache-2.0  (https://www.apache.org/licenses/LICENSE-2.0.txt)
+  - Apache Commons Lang (https://commons.apache.org/proper/commons-lang/) org.apache.commons:commons-lang3:jar:3.18.0
+    License: Apache-2.0  (https://www.apache.org/licenses/LICENSE-2.0.txt)
+  - Flink : Clients (https://flink.apache.org/flink-clients) org.apache.flink:flink-clients:jar:2.1.0
+    License: The Apache Software License, Version 2.0  (https://www.apache.org/licenses/LICENSE-2.0.txt)
+  - Flink : Connectors : Base (https://flink.apache.org/flink-connectors/flink-connector-base) org.apache.flink:flink-connector-base:jar:2.1.0
+    License: The Apache Software License, Version 2.0  (https://www.apache.org/licenses/LICENSE-2.0.txt)
+  - Flink : DataStream : Impl (https://flink.apache.org/flink-datastream) org.apache.flink:flink-datastream:jar:2.1.0
+    License: The Apache Software License, Version 2.0  (https://www.apache.org/licenses/LICENSE-2.0.txt)
+  - Flink : DataStream : API (https://flink.apache.org/flink-datastream-api) org.apache.flink:flink-datastream-api:jar:2.1.0
+    License: The Apache Software License, Version 2.0  (https://www.apache.org/licenses/LICENSE-2.0.txt)
+
+From: 'xerial.org' (https://github.com/xerial/snappy-java)
+  - snappy-java (https://github.com/xerial/snappy-java) org.xerial.snappy:snappy-java:bundle:1.1.10.7
+    License: Apache-2.0  (https://www.apache.org/licenses/LICENSE-2.0.html)
+
+
+
+

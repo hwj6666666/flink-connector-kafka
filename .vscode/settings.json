@@ -1,0 +1,12 @@
+{
+  "java.configuration.updateBuildConfiguration": "interactive",
+  "java.compile.nullAnalysis.mode": "automatic",
+  "editor.formatOnSave": true,
+  "files.exclude": {
+    "**/target": true,
+    "**/.build": true
+  }
+}
+{
+    "java.compile.nullAnalysis.mode": "automatic"
+}

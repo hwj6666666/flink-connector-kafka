@@ -1,0 +1,6 @@
+app:
+  name: flink-dynamic-sink-project
+  bootstrap-servers: localhost:9094
+  cluster-id: default-cluster
+  stream-pattern: "^dynamic-kafka-sink$"
+  records: alpha,beta,gamma

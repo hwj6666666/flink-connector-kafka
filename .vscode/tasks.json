@@ -1,0 +1,30 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Maven: Compile",
+      "type": "shell",
+      "command": "mvn -DskipTests compile",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Flink: Run OrderJob (local)",
+      "type": "shell",
+      "command": "./run.sh run",
+      "problemMatcher": []
+    },
+    {
+      "label": "Docker: Setup Kafka",
+      "type": "shell",
+      "command": "./run.sh setup",
+      "problemMatcher": []
+    },
+    {
+      "label": "Run: Setup + Local Application",
+      "type": "shell",
+      "command": "./run.sh run",
+      "problemMatcher": []
+    }
+  ]
+}
