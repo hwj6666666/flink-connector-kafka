@@ -11,8 +11,8 @@
     <name>Dynamic Kafka Sink Parent</name>
 
     <modules>
-        <module>dynamic-kafka-sink-connector</module>
-        <module>dynamic-kafka-sink-app</module>
+        <module>connector</module>
+        <module>app</module>
     </modules>
 
     <properties>

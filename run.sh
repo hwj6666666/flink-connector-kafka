@@ -3,13 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_SOCKET="${HOME}/.docker/run/docker.sock"
-DOCKER_SOCKET="${DOCKER_SOCKET:-${DEFAULT_SOCKET}}"
 COMMAND="${1:-}"
-
-if [[ ! -S "${DOCKER_SOCKET}" && -S "/var/run/docker.sock" ]]; then
-  DOCKER_SOCKET="/var/run/docker.sock"
-fi
+MODE="${2:-}"
 
 if [[ -f "${SCRIPT_DIR}/.env" ]]; then
   set -a
@@ -19,22 +14,27 @@ if [[ -f "${SCRIPT_DIR}/.env" ]]; then
 fi
 
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-flink-dynamic-kafka-sink}"
-APP_CLUSTER_ID="${APP_CLUSTER_ID:-default-cluster}"
-APP_TOPIC="${APP_TOPIC:-dynamic-kafka-sink}"
-APP_STREAM_PATTERN="${APP_STREAM_PATTERN:-^${APP_TOPIC}$}"
-APP_RECORDS="${APP_RECORDS:-alpha,beta,gamma}"
+
+DYNAMIC_CLUSTER_ID="${DYNAMIC_CLUSTER_ID:-default-cluster}"
+DYNAMIC_TOPIC="${DYNAMIC_TOPIC:-dynamic-kafka-sink}"
+DYNAMIC_STREAM_PATTERN="${DYNAMIC_STREAM_PATTERN:-^${DYNAMIC_TOPIC}$}"
+DYNAMIC_BOOTSTRAP_SERVERS="${DYNAMIC_BOOTSTRAP_SERVERS:-localhost:9092}"
+DYNAMIC_EMIT_INTERVAL_MS="${DYNAMIC_EMIT_INTERVAL_MS:-0}"
+DYNAMIC_PARALLELISM="${DYNAMIC_PARALLELISM:-1}"
+DYNAMIC_DISCOVERY_INTERVAL_MS="${DYNAMIC_DISCOVERY_INTERVAL_MS:-2000}"
+
+REGULAR_TOPIC="${REGULAR_TOPIC:-${DYNAMIC_TOPIC}}"
+REGULAR_BOOTSTRAP_SERVERS="${REGULAR_BOOTSTRAP_SERVERS:-${DYNAMIC_BOOTSTRAP_SERVERS}}"
+REGULAR_EMIT_INTERVAL_MS="${REGULAR_EMIT_INTERVAL_MS:-0}"
+REGULAR_PARALLELISM="${REGULAR_PARALLELISM:-1}"
 
 usage() {
   cat <<'EOF'
 Usage:
-  ./run.sh setup   Install local prerequisites and prepare Kafka topic
-  ./run.sh run     Prepare Kafka, build jar locally, and run the application
-  ./run.sh down    Stop and remove application containers
+  ./run.sh setup                 Verify local Kafka and create topics
+  ./run.sh run dynamic           Run dynamic sink benchmark job
+  ./run.sh run regular           Run regular KafkaSink benchmark job
 EOF
-}
-
-require_docker() {
-  docker info >/dev/null
 }
 
 java_major_version() {
@@ -88,57 +88,89 @@ ensure_env_file() {
   fi
 }
 
-wait_for_kafka() {
-  echo "Waiting for Kafka broker to become ready..."
+kafka_topics_cmd() {
+  if command -v kafka-topics >/dev/null 2>&1; then
+    echo "kafka-topics"
+    return 0
+  fi
+  if command -v kafka-topics.sh >/dev/null 2>&1; then
+    echo "kafka-topics.sh"
+    return 0
+  fi
+  echo "Kafka CLI not found. Install Kafka via Homebrew and ensure kafka-topics is in PATH." >&2
+  return 1
+}
+
+ensure_local_kafka_ready() {
+  local topics_cmd
+  topics_cmd="$(kafka_topics_cmd)"
+  echo "Checking local Kafka broker at ${DYNAMIC_BOOTSTRAP_SERVERS} ..."
   for _ in {1..30}; do
-    if docker compose -f "${SCRIPT_DIR}/docker-compose.yml" exec -T kafka \
-      kafka-topics --bootstrap-server kafka:9092 --list >/dev/null 2>&1; then
+    if "${topics_cmd}" --bootstrap-server "${DYNAMIC_BOOTSTRAP_SERVERS}" --list >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
   done
-  echo "Kafka broker did not become ready in time." >&2
+  echo "Local Kafka broker is not reachable at ${DYNAMIC_BOOTSTRAP_SERVERS}." >&2
   return 1
 }
 
-setup_env() {
+setup_local_env() {
   ensure_java_17
   ensure_env_file
-  require_docker
-  docker compose -f "${SCRIPT_DIR}/docker-compose.yml" up -d kafka
-  wait_for_kafka
-  docker compose -f "${SCRIPT_DIR}/docker-compose.yml" exec -T kafka \
-    kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
-    --topic "${APP_TOPIC}" --partitions 1 --replication-factor 1
+  ensure_local_kafka_ready
+  local topics_cmd
+  topics_cmd="$(kafka_topics_cmd)"
+  "${topics_cmd}" --bootstrap-server "${DYNAMIC_BOOTSTRAP_SERVERS}" --create --if-not-exists \
+    --topic "${DYNAMIC_TOPIC}" --partitions 1 --replication-factor 1
+  "${topics_cmd}" --bootstrap-server "${REGULAR_BOOTSTRAP_SERVERS}" --create --if-not-exists \
+    --topic "${REGULAR_TOPIC}" --partitions 1 --replication-factor 1
 }
 
-run_application() {
-  setup_env
-  mvn -DskipTests -pl dynamic-kafka-sink-app -am package
-  java -jar "${SCRIPT_DIR}/dynamic-kafka-sink-app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar" \
-    --bootstrap-servers kafka:9092 \
-    --stream-pattern "${APP_STREAM_PATTERN}" \
-    --cluster-id "${APP_CLUSTER_ID}" \
-    --records "${APP_RECORDS}"
+build_app() {
+  setup_local_env
+  mvn -DskipTests -pl app -am package
+}
 
-  echo
-  echo "Produced records:"
-  docker compose -f "${SCRIPT_DIR}/docker-compose.yml" exec -T kafka \
-    kafka-console-consumer --bootstrap-server kafka:9092 \
-    --topic "${APP_TOPIC}" --from-beginning \
-    --max-messages "$(awk -F',' '{print NF}' <<<"${APP_RECORDS}")"
+run_dynamic_job() {
+  build_app
+  java -cp "${SCRIPT_DIR}/app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar" \
+    org.apache.flink.dynamic.sink.job.DynamicJob \
+    --bootstrap-servers "${DYNAMIC_BOOTSTRAP_SERVERS}" \
+    --stream-pattern "${DYNAMIC_STREAM_PATTERN}" \
+    --cluster-id "${DYNAMIC_CLUSTER_ID}" \
+    --emit-interval-ms "${DYNAMIC_EMIT_INTERVAL_MS}" \
+    --parallelism "${DYNAMIC_PARALLELISM}" \
+    --discovery-interval-ms "${DYNAMIC_DISCOVERY_INTERVAL_MS}"
+}
+
+run_regular_job() {
+  build_app
+  java -cp "${SCRIPT_DIR}/app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar" \
+    org.apache.flink.dynamic.sink.job.RegularJob \
+    --bootstrap-servers "${REGULAR_BOOTSTRAP_SERVERS}" \
+    --topic "${REGULAR_TOPIC}" \
+    --emit-interval-ms "${REGULAR_EMIT_INTERVAL_MS}" \
+    --parallelism "${REGULAR_PARALLELISM}"
 }
 
 case "${COMMAND}" in
   setup)
-    setup_env
+    setup_local_env
     ;;
   run)
-    run_application
-    ;;
-  down)
-    require_docker
-    docker compose -f "${SCRIPT_DIR}/docker-compose.yml" down -v
+    case "${MODE}" in
+      dynamic)
+        run_dynamic_job
+        ;;
+      regular)
+        run_regular_job
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
     ;;
   *)
     usage

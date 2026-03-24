@@ -15,7 +15,7 @@
       "problemMatcher": []
     },
     {
-      "label": "Docker: Setup Kafka",
+      "label": "Local Kafka: Setup Topic",
       "type": "shell",
       "command": "./run.sh setup",
       "problemMatcher": []
