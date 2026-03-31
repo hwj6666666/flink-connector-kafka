@@ -3,30 +3,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config.yaml"
 COMMAND="${1:-}"
 MODE="${2:-}"
-
-if [[ -f "${SCRIPT_DIR}/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "${SCRIPT_DIR}/.env"
-  set +a
-fi
-
-export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-flink-dynamic-kafka-sink}"
-
-DYNAMIC_CLUSTER_ID="${DYNAMIC_CLUSTER_ID:-default-cluster}"
-DYNAMIC_TOPIC="${DYNAMIC_TOPIC:-dynamic-kafka-sink}"
-DYNAMIC_STREAM_PATTERN="${DYNAMIC_STREAM_PATTERN:-^${DYNAMIC_TOPIC}$}"
-DYNAMIC_BOOTSTRAP_SERVERS="${DYNAMIC_BOOTSTRAP_SERVERS:-localhost:9092}"
-DYNAMIC_EMIT_INTERVAL_MS="${DYNAMIC_EMIT_INTERVAL_MS:-0}"
-DYNAMIC_PARALLELISM="${DYNAMIC_PARALLELISM:-1}"
-DYNAMIC_DISCOVERY_INTERVAL_MS="${DYNAMIC_DISCOVERY_INTERVAL_MS:-2000}"
-
-REGULAR_TOPIC="${REGULAR_TOPIC:-${DYNAMIC_TOPIC}}"
-REGULAR_BOOTSTRAP_SERVERS="${REGULAR_BOOTSTRAP_SERVERS:-${DYNAMIC_BOOTSTRAP_SERVERS}}"
-REGULAR_EMIT_INTERVAL_MS="${REGULAR_EMIT_INTERVAL_MS:-0}"
-REGULAR_PARALLELISM="${REGULAR_PARALLELISM:-1}"
 
 usage() {
   cat <<'EOF'
@@ -35,6 +14,52 @@ Usage:
   ./run.sh run dynamic           Run dynamic sink benchmark job
   ./run.sh run regular           Run regular KafkaSink benchmark job
 EOF
+}
+
+yaml_get() {
+  local key="$1"
+  ruby -ryaml -e '
+    data = YAML.load_file(ARGV[0]) || {}
+    value = ARGV[1].split(".").reduce(data) { |memo, part| memo.is_a?(Hash) ? memo[part] : nil }
+    puts(value.nil? ? "" : value)
+  ' "${CONFIG_FILE}" "${key}"
+}
+
+ensure_config_file() {
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "Missing config file at ${CONFIG_FILE}." >&2
+    return 1
+  fi
+}
+
+load_config() {
+  ensure_config_file
+
+  DYNAMIC_CLUSTER_ID="$(yaml_get "dynamic.cluster_id")"
+  DYNAMIC_TOPIC="$(yaml_get "dynamic.topic")"
+  DYNAMIC_STREAM_PATTERN="$(yaml_get "dynamic.stream_pattern")"
+  DYNAMIC_BOOTSTRAP_SERVERS="$(yaml_get "dynamic.bootstrap_servers")"
+  DYNAMIC_EMIT_INTERVAL_MS="$(yaml_get "dynamic.emit_interval_ms")"
+  DYNAMIC_PARALLELISM="$(yaml_get "dynamic.parallelism")"
+  DYNAMIC_DISCOVERY_INTERVAL_MS="$(yaml_get "dynamic.discovery_interval_ms")"
+
+  REGULAR_TOPIC="$(yaml_get "regular.topic")"
+  REGULAR_BOOTSTRAP_SERVERS="$(yaml_get "regular.bootstrap_servers")"
+  REGULAR_EMIT_INTERVAL_MS="$(yaml_get "regular.emit_interval_ms")"
+  REGULAR_PARALLELISM="$(yaml_get "regular.parallelism")"
+
+  DYNAMIC_CLUSTER_ID="${DYNAMIC_CLUSTER_ID:-default-cluster}"
+  DYNAMIC_TOPIC="${DYNAMIC_TOPIC:-dynamic-kafka-sink}"
+  DYNAMIC_STREAM_PATTERN="${DYNAMIC_STREAM_PATTERN:-^${DYNAMIC_TOPIC}$}"
+  DYNAMIC_BOOTSTRAP_SERVERS="${DYNAMIC_BOOTSTRAP_SERVERS:-localhost:9092}"
+  DYNAMIC_EMIT_INTERVAL_MS="${DYNAMIC_EMIT_INTERVAL_MS:-0}"
+  DYNAMIC_PARALLELISM="${DYNAMIC_PARALLELISM:-1}"
+  DYNAMIC_DISCOVERY_INTERVAL_MS="${DYNAMIC_DISCOVERY_INTERVAL_MS:-2000}"
+
+  REGULAR_TOPIC="${REGULAR_TOPIC:-${DYNAMIC_TOPIC}}"
+  REGULAR_BOOTSTRAP_SERVERS="${REGULAR_BOOTSTRAP_SERVERS:-${DYNAMIC_BOOTSTRAP_SERVERS}}"
+  REGULAR_EMIT_INTERVAL_MS="${REGULAR_EMIT_INTERVAL_MS:-0}"
+  REGULAR_PARALLELISM="${REGULAR_PARALLELISM:-1}"
 }
 
 java_major_version() {
@@ -81,13 +106,6 @@ ensure_java_17() {
   export PATH="${JAVA_HOME}/bin:${PATH}"
 }
 
-ensure_env_file() {
-  if [[ ! -f "${SCRIPT_DIR}/.env" ]]; then
-    echo "Missing .env file at project root." >&2
-    return 1
-  fi
-}
-
 kafka_topics_cmd() {
   if command -v kafka-topics >/dev/null 2>&1; then
     echo "kafka-topics"
@@ -117,7 +135,7 @@ ensure_local_kafka_ready() {
 
 setup_local_env() {
   ensure_java_17
-  ensure_env_file
+  load_config
   ensure_local_kafka_ready
   local topics_cmd
   topics_cmd="$(kafka_topics_cmd)"
@@ -141,7 +159,8 @@ run_dynamic_job() {
     --cluster-id "${DYNAMIC_CLUSTER_ID}" \
     --emit-interval-ms "${DYNAMIC_EMIT_INTERVAL_MS}" \
     --parallelism "${DYNAMIC_PARALLELISM}" \
-    --discovery-interval-ms "${DYNAMIC_DISCOVERY_INTERVAL_MS}"
+    --discovery-interval-ms "${DYNAMIC_DISCOVERY_INTERVAL_MS}" \
+    --config-file "${CONFIG_FILE}"
 }
 
 run_regular_job() {

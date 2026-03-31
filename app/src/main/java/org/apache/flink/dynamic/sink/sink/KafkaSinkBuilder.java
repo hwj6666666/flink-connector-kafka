@@ -18,21 +18,23 @@
 
 package org.apache.flink.dynamic.sink.sink;
 
-import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.metadata.SingleClusterTopicMetadataService;
 import org.apache.flink.connector.kafka.sink.DynamicKafkaSink;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
+import org.apache.flink.dynamic.sink.job.DynamicSinkEvent;
 
 import org.apache.kafka.clients.producer.ProducerConfig;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Properties;
 import java.util.regex.Pattern;
 
 /** Sink builder wrapper for job layer. */
 public class KafkaSinkBuilder {
 
-    public DynamicKafkaSink<String> build(
+    public DynamicKafkaSink<DynamicSinkEvent> build(
             String bootstrapServers,
             String clusterId,
             String pattern,
@@ -41,14 +43,24 @@ public class KafkaSinkBuilder {
         properties.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         properties.setProperty(
                 "stream-metadata-discovery-interval-ms", String.valueOf(discoveryIntervalMs));
-        return DynamicKafkaSink.<String>builder()
+        return DynamicKafkaSink.<DynamicSinkEvent>builder()
                 .setStreamPattern(Pattern.compile(pattern))
                 .setKafkaMetadataService(
                         new SingleClusterTopicMetadataService(clusterId, properties))
                 .setRecordSerializer(
-                        KafkaRecordSerializationSchema.<String>builder()
+                        KafkaRecordSerializationSchema.<DynamicSinkEvent>builder()
                                 .setTopic("unused-by-dynamic-sink")
-                                .setValueSerializationSchema(new SimpleStringSchema())
+                                .setValueSerializationSchema(
+                                        (SerializationSchema<DynamicSinkEvent>)
+                                                event -> {
+                                                    if (event == null || event.isRouteUpdate()) {
+                                                        return null;
+                                                    }
+                                                    return event.getMessage() == null
+                                                            ? null
+                                                            : event.getMessage()
+                                                                    .getBytes(StandardCharsets.UTF_8);
+                                                })
                                 .build())
                 .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
                 .setProperties(properties)

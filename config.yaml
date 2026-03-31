@@ -1,0 +1,23 @@
+dynamic:
+  cluster_id: default-cluster
+  topic: dynamic-kafka-sink
+  stream_pattern: "^wjh.*$"
+  bootstrap_servers: localhost:9092
+  emit_interval_ms: 0
+  parallelism: 1
+  discovery_interval_ms: 2000
+  route_map:
+    route-a:
+      cluster_id: default-cluster
+      bootstrap_servers: localhost:9092
+      topic_regex: "^dynamic-kafka-sink-a$"
+    route-b:
+      cluster_id: default-cluster
+      bootstrap_servers: localhost:9092
+      topic_regex: "^dynamic-kafka-sink-b$"
+
+regular:
+  topic: dynamic-kafka-sink
+  bootstrap_servers: localhost:9092
+  emit_interval_ms: 0
+  parallelism: 1

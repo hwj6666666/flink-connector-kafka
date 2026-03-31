@@ -35,6 +35,8 @@ import org.apache.flink.connector.kafka.sink.lineage.KafkaDatasetFacetProvider;
 import org.apache.flink.connector.kafka.sink.lineage.TypeDatasetFacet;
 import org.apache.flink.connector.kafka.sink.lineage.TypeDatasetFacetProvider;
 import org.apache.flink.connector.kafka.sink.KafkaCommittable;
+import org.apache.flink.connector.kafka.sink.DynamicKafkaRouteEvent;
+import org.apache.flink.connector.kafka.sink.KafkaRouteDestination;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.sink.KafkaWriterState;
@@ -58,6 +60,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /** Writer implementation for the dynamic Kafka sink runtime. */
@@ -75,6 +78,8 @@ public class DynamicKafkaSinkWriter<IN>
     private final TransactionNamingStrategy transactionNamingStrategy;
     private final long metadataRefreshIntervalMs;
     private final Map<String, ClusterWriter<IN>> clusterWritersByRouteId;
+    private final Map<String, KafkaRouteDestination> explicitRoutesById;
+    private final Map<String, Set<String>> explicitResolvedRouteIdsByLogicalId;
 
     private Set<String> activeRouteIds;
     private long nextMetadataRefreshTimestamp;
@@ -102,6 +107,8 @@ public class DynamicKafkaSinkWriter<IN>
         this.transactionNamingStrategy = transactionNamingStrategy;
         this.metadataRefreshIntervalMs = metadataRefreshIntervalMs;
         this.clusterWritersByRouteId = new LinkedHashMap<>();
+        this.explicitRoutesById = new LinkedHashMap<>();
+        this.explicitResolvedRouteIdsByLogicalId = new LinkedHashMap<>();
         this.nextMetadataRefreshTimestamp = Long.MIN_VALUE;
         this.activeRouteIds = Collections.emptySet();
 
@@ -122,6 +129,18 @@ public class DynamicKafkaSinkWriter<IN>
 
     @Override
     public void write(IN element, Context context) throws IOException, InterruptedException {
+        if (element instanceof DynamicKafkaRouteEvent) {
+            DynamicKafkaRouteEvent routeEvent = (DynamicKafkaRouteEvent) element;
+            if (routeEvent.isRouteUpdate()) {
+                applyRouteUpdates(routeEvent.getRouteUpdates());
+                return;
+            }
+            String routeId = routeEvent.getRouteId();
+            if (routeId != null) {
+                writeToExplicitRoute(routeId, element, context);
+                return;
+            }
+        }
         refreshRouteIfNeeded(false);
         Preconditions.checkState(
                 !activeRouteIds.isEmpty(), "No active routes resolved for DynamicKafkaSink.");
@@ -130,6 +149,80 @@ public class DynamicKafkaSinkWriter<IN>
             Preconditions.checkState(
                     clusterWriter != null, "No writer created for active route '%s'.", routeId);
             Preconditions.checkNotNull(clusterWriter).writer.write(element, context);
+        }
+    }
+
+    private void writeToExplicitRoute(String routeId, IN element, Context context)
+            throws IOException, InterruptedException {
+        KafkaRouteDestination destination = explicitRoutesById.get(routeId);
+        if (destination == null) {
+            throw new IllegalStateException(
+                    String.format("Route id '%s' not found. Send a route update event first.", routeId));
+        }
+        Set<String> physicalRouteIds = explicitResolvedRouteIdsByLogicalId.get(routeId);
+        if (physicalRouteIds == null || physicalRouteIds.isEmpty()) {
+            List<ResolvedRoute> resolvedRoutes = resolveExplicitRoutes(routeId, destination);
+            Preconditions.checkState(
+                    !resolvedRoutes.isEmpty(),
+                    "Route id '%s' has no matching topics for regex '%s'.",
+                    routeId,
+                    destination.getTopicPattern());
+            physicalRouteIds = resolvedRoutes.stream().map(route -> route.routeId).collect(Collectors.toSet());
+            explicitResolvedRouteIdsByLogicalId.put(routeId, physicalRouteIds);
+            for (ResolvedRoute route : resolvedRoutes) {
+                clusterWritersByRouteId.computeIfAbsent(
+                        route.routeId,
+                        ignored -> {
+                            try {
+                                return createClusterWriter(
+                                        route.routeId,
+                                        route.kafkaClusterId,
+                                        route.topic,
+                                        route.transactionalIdPrefix,
+                                        route.kafkaProducerConfig,
+                                        Collections.emptyList());
+                            } catch (IOException error) {
+                                throw new RuntimeException(error);
+                            }
+                        });
+            }
+        }
+        for (String physicalRouteId : physicalRouteIds) {
+            ClusterWriter<IN> clusterWriter = clusterWritersByRouteId.get(physicalRouteId);
+            if (clusterWriter == null) {
+                throw new IllegalStateException(
+                        String.format(
+                                "No writer created for physical route '%s' of logical route '%s'.",
+                                physicalRouteId,
+                                routeId));
+            }
+            clusterWriter.writer.write(element, context);
+        }
+    }
+
+    private void applyRouteUpdates(Map<String, KafkaRouteDestination> routeUpdates) {
+        if (routeUpdates == null || routeUpdates.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, KafkaRouteDestination> entry : routeUpdates.entrySet()) {
+            String routeId = entry.getKey();
+            KafkaRouteDestination destination = entry.getValue();
+            Preconditions.checkState(routeId != null && !routeId.isBlank(), "Route id must not be empty.");
+            if (destination == null) {
+                throw new IllegalStateException(
+                        String.format("Destination must not be null for route id '%s'.", routeId));
+            }
+            Preconditions.checkState(
+                    destination.getBootstrapServers() != null
+                            && !destination.getBootstrapServers().isBlank(),
+                    "bootstrap.servers must be provided for route id '%s'.",
+                    routeId);
+            Preconditions.checkState(
+                    destination.getTopicPattern() != null && !destination.getTopicPattern().isBlank(),
+                    "Topic regex must be provided for route id '%s'.",
+                    routeId);
+            explicitRoutesById.put(routeId, destination);
+            explicitResolvedRouteIdsByLogicalId.remove(routeId);
         }
     }
 
@@ -276,25 +369,7 @@ public class DynamicKafkaSinkWriter<IN>
                         kafkaClusterId);
 
                 for (String topic : clusterEntry.getValue().getTopics()) {
-                    Properties kafkaProducerConfig = new Properties();
-                    kafkaProducerConfig.putAll(commonProperties);
-                    kafkaProducerConfig.putAll(clusterEntry.getValue().getProperties());
-
-                    String bootstrapServers =
-                            kafkaProducerConfig.getProperty(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG);
-                    Preconditions.checkState(
-                            bootstrapServers != null && !bootstrapServers.isEmpty(),
-                            "DynamicKafkaSink requires bootstrap servers for cluster '%s'.",
-                            kafkaClusterId);
-
-                    String routeId = kafkaClusterId + "|" + topic + "|" + bootstrapServers;
-                    routes.add(
-                            new ResolvedRoute(
-                                    routeId,
-                                    kafkaClusterId,
-                                    topic,
-                                    buildTransactionalIdPrefix(routeId),
-                                    kafkaProducerConfig));
+                    routes.add(createResolvedRoute(kafkaClusterId, topic, clusterEntry.getValue().getProperties()));
                 }
             }
         }
@@ -308,6 +383,76 @@ public class DynamicKafkaSinkWriter<IN>
         return routes;
     }
 
+    private ResolvedRoute createResolvedRoute(
+            String kafkaClusterId, String topic, Properties overrideProperties) {
+        Properties kafkaProducerConfig = new Properties();
+        kafkaProducerConfig.putAll(commonProperties);
+        kafkaProducerConfig.putAll(overrideProperties);
+
+        String bootstrapServers =
+                kafkaProducerConfig.getProperty(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG);
+        Preconditions.checkState(
+                bootstrapServers != null && !bootstrapServers.isEmpty(),
+                "DynamicKafkaSink requires bootstrap servers for cluster '%s'.",
+                kafkaClusterId);
+        String routeId = kafkaClusterId + "|" + topic + "|" + bootstrapServers;
+        return new ResolvedRoute(
+                routeId,
+                kafkaClusterId,
+                topic,
+                buildTransactionalIdPrefix(routeId),
+                kafkaProducerConfig);
+    }
+
+    private List<ResolvedRoute> resolveExplicitRoutes(
+            String logicalRouteId, KafkaRouteDestination destination) {
+        Pattern topicPattern = Pattern.compile(destination.getTopicPattern());
+        List<ResolvedRoute> resolvedRoutes = new ArrayList<>();
+        for (KafkaStream stream : kafkaMetadataService.getAllStreams()) {
+            if (!topicPattern.matcher(stream.getStreamId()).find()) {
+                continue;
+            }
+            for (Map.Entry<String, ClusterMetadata> clusterEntry : stream.getClusterMetadataMap().entrySet()) {
+                String clusterId =
+                        (destination.getKafkaClusterId() == null || destination.getKafkaClusterId().isBlank())
+                                ? clusterEntry.getKey()
+                                : destination.getKafkaClusterId();
+                if (!kafkaMetadataService.isClusterActive(clusterId)) {
+                    continue;
+                }
+                for (String topic : clusterEntry.getValue().getTopics()) {
+                    if (!topicPattern.matcher(topic).find()) {
+                        continue;
+                    }
+                    String routeId =
+                            logicalRouteId
+                                    + "|"
+                                    + clusterId
+                                    + "|"
+                                    + topic
+                                    + "|"
+                                    + destination.getBootstrapServers();
+                    resolvedRoutes.add(createResolvedRoute(routeId, clusterId, topic, destination));
+                }
+            }
+        }
+        return resolvedRoutes;
+    }
+
+    private ResolvedRoute createResolvedRoute(
+            String routeId, String clusterId, String topic, KafkaRouteDestination destination) {
+        Properties kafkaProducerConfig = new Properties();
+        kafkaProducerConfig.putAll(commonProperties);
+        kafkaProducerConfig.setProperty(
+                CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, destination.getBootstrapServers());
+        return new ResolvedRoute(
+                routeId,
+                clusterId,
+                topic,
+                buildTransactionalIdPrefix(routeId),
+                kafkaProducerConfig);
+    }
+
     private ClusterWriter<IN> createClusterWriter(
             String routeId,
             String kafkaClusterId,
@@ -317,7 +462,6 @@ public class DynamicKafkaSinkWriter<IN>
             Collection<KafkaWriterState> recoveredStates)
             throws IOException {
         KafkaRecordSerializationSchema<IN> clusterSerializer = cloneSerializerForRoute(topic);
-        @SuppressWarnings("unchecked")
         TwoPhaseCommittingStatefulSink<IN, KafkaWriterState, KafkaCommittable> clusterSink =
                 (TwoPhaseCommittingStatefulSink<IN, KafkaWriterState, KafkaCommittable>)
                         KafkaSink.<IN>builder()
