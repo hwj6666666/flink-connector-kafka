@@ -5,6 +5,9 @@ import java.util.Map;
 
 /**
  * Optional contract for sink input records that carry route updates and id-based route selection.
+ *
+ * <p>For route updates, a map entry with a {@code null} destination indicates that the logical
+ * route should be removed.
  */
 public interface DynamicKafkaRouteEvent {
 

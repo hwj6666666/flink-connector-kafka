@@ -32,6 +32,11 @@ public class DynamicSinkEvent implements DynamicKafkaRouteEvent {
         return new DynamicSinkEvent(true, null, null, routeUpdates);
     }
 
+    public static DynamicSinkEvent remove(String routeId) {
+        return new DynamicSinkEvent(
+                true, null, null, Collections.singletonMap(routeId, (KafkaRouteDestination) null));
+    }
+
     public String getMessage() {
         return message;
     }

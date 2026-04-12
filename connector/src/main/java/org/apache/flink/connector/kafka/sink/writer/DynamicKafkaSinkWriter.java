@@ -55,6 +55,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -209,8 +210,9 @@ public class DynamicKafkaSinkWriter<IN>
             KafkaRouteDestination destination = entry.getValue();
             Preconditions.checkState(routeId != null && !routeId.isBlank(), "Route id must not be empty.");
             if (destination == null) {
-                throw new IllegalStateException(
-                        String.format("Destination must not be null for route id '%s'.", routeId));
+                explicitRoutesById.remove(routeId);
+                explicitResolvedRouteIdsByLogicalId.remove(routeId);
+                continue;
             }
             Preconditions.checkState(
                     destination.getBootstrapServers() != null
@@ -232,6 +234,7 @@ public class DynamicKafkaSinkWriter<IN>
         for (ClusterWriter<IN> clusterWriter : clusterWritersByRouteId.values()) {
             clusterWriter.writer.flush(endOfInput);
         }
+        cleanupRetiredWriters();
     }
 
     @Override
@@ -250,6 +253,7 @@ public class DynamicKafkaSinkWriter<IN>
                                 kafkaCommittable));
             }
         }
+        cleanupRetiredWriters();
         return committables;
     }
 
@@ -270,6 +274,7 @@ public class DynamicKafkaSinkWriter<IN>
                                 kafkaStates));
             }
         }
+        cleanupRetiredWriters();
         return states;
     }
 
@@ -339,6 +344,53 @@ public class DynamicKafkaSinkWriter<IN>
                         }
                     });
         }
+        cleanupRetiredWriters();
+    }
+
+    private void cleanupRetiredWriters() throws IOException {
+        if (deliveryGuarantee == DeliveryGuarantee.EXACTLY_ONCE) {
+            return;
+        }
+
+        Set<String> referencedRouteIds = getReferencedRouteIds();
+        List<String> retiredRouteIds =
+                clusterWritersByRouteId.keySet().stream()
+                        .filter(routeId -> !referencedRouteIds.contains(routeId))
+                        .collect(Collectors.toList());
+
+        IOException firstError = null;
+        for (String retiredRouteId : retiredRouteIds) {
+            ClusterWriter<IN> retiredWriter = clusterWritersByRouteId.remove(retiredRouteId);
+            if (retiredWriter == null) {
+                continue;
+            }
+            try {
+                retiredWriter.writer.close();
+            } catch (Exception error) {
+                if (firstError == null) {
+                    firstError =
+                            new IOException(
+                                    String.format(
+                                            "Failed to close retired route writer '%s'.",
+                                            retiredRouteId),
+                                    error);
+                } else {
+                    firstError.addSuppressed(error);
+                }
+            }
+        }
+
+        if (firstError != null) {
+            throw firstError;
+        }
+    }
+
+    private Set<String> getReferencedRouteIds() {
+        Set<String> referencedRouteIds = new LinkedHashSet<>(activeRouteIds);
+        for (Set<String> physicalRouteIds : explicitResolvedRouteIdsByLogicalId.values()) {
+            referencedRouteIds.addAll(physicalRouteIds);
+        }
+        return referencedRouteIds;
     }
 
     private List<ResolvedRoute> resolveRoutes() {
@@ -409,14 +461,13 @@ public class DynamicKafkaSinkWriter<IN>
         Pattern topicPattern = Pattern.compile(destination.getTopicPattern());
         List<ResolvedRoute> resolvedRoutes = new ArrayList<>();
         for (KafkaStream stream : kafkaMetadataService.getAllStreams()) {
-            if (!topicPattern.matcher(stream.getStreamId()).find()) {
-                continue;
-            }
             for (Map.Entry<String, ClusterMetadata> clusterEntry : stream.getClusterMetadataMap().entrySet()) {
-                String clusterId =
-                        (destination.getKafkaClusterId() == null || destination.getKafkaClusterId().isBlank())
-                                ? clusterEntry.getKey()
-                                : destination.getKafkaClusterId();
+                if (destination.getKafkaClusterId() != null
+                        && !destination.getKafkaClusterId().isBlank()
+                        && !destination.getKafkaClusterId().equals(clusterEntry.getKey())) {
+                    continue;
+                }
+                String clusterId = clusterEntry.getKey();
                 if (!kafkaMetadataService.isClusterActive(clusterId)) {
                     continue;
                 }

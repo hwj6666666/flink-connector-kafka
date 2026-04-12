@@ -200,7 +200,11 @@ public class DynamicJob {
                 return;
             }
             for (Map.Entry<String, KafkaRouteDestination> entry : value.getRouteUpdates().entrySet()) {
-                ctx.getBroadcastState(routeMapStateDesc).put(entry.getKey(), entry.getValue());
+                if (entry.getValue() == null) {
+                    ctx.getBroadcastState(routeMapStateDesc).remove(entry.getKey());
+                } else {
+                    ctx.getBroadcastState(routeMapStateDesc).put(entry.getKey(), entry.getValue());
+                }
             }
             out.collect(value);
         }
