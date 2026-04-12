@@ -22,6 +22,7 @@ import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.metadata.SingleClusterTopicMetadataService;
 import org.apache.flink.connector.kafka.sink.DynamicKafkaSink;
+import org.apache.flink.connector.kafka.sink.DynamicKafkaSinkBuilder;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.dynamic.sink.job.DynamicSinkEvent;
 
@@ -38,32 +39,45 @@ public class KafkaSinkBuilder {
             String bootstrapServers,
             String clusterId,
             String pattern,
-            long discoveryIntervalMs) {
+            long discoveryIntervalMs,
+            DeliveryGuarantee deliveryGuarantee,
+            String transactionalIdPrefix) {
         Properties properties = new Properties();
         properties.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         properties.setProperty(
                 "stream-metadata-discovery-interval-ms", String.valueOf(discoveryIntervalMs));
-        return DynamicKafkaSink.<DynamicSinkEvent>builder()
-                .setStreamPattern(Pattern.compile(pattern))
-                .setKafkaMetadataService(
-                        new SingleClusterTopicMetadataService(clusterId, properties))
-                .setRecordSerializer(
-                        KafkaRecordSerializationSchema.<DynamicSinkEvent>builder()
-                                .setTopic("unused-by-dynamic-sink")
-                                .setValueSerializationSchema(
-                                        (SerializationSchema<DynamicSinkEvent>)
-                                                event -> {
-                                                    if (event == null || event.isRouteUpdate()) {
-                                                        return null;
-                                                    }
-                                                    return event.getMessage() == null
-                                                            ? null
-                                                            : event.getMessage()
-                                                                    .getBytes(StandardCharsets.UTF_8);
-                                                })
-                                .build())
-                .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
-                .setProperties(properties)
-                .build();
+        if (deliveryGuarantee == DeliveryGuarantee.EXACTLY_ONCE) {
+            // Use a conservative timeout so local brokers with a lower
+            // transaction.max.timeout.ms can still initialize transactional producers.
+            properties.setProperty(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG, "60000");
+        }
+        DynamicKafkaSinkBuilder<DynamicSinkEvent> builder =
+                DynamicKafkaSink.<DynamicSinkEvent>builder()
+                        .setStreamPattern(Pattern.compile(pattern))
+                        .setKafkaMetadataService(
+                                new SingleClusterTopicMetadataService(clusterId, properties))
+                        .setRecordSerializer(
+                                KafkaRecordSerializationSchema.<DynamicSinkEvent>builder()
+                                        .setTopic("unused-by-dynamic-sink")
+                                        .setValueSerializationSchema(
+                                                (SerializationSchema<DynamicSinkEvent>)
+                                                        event -> {
+                                                            if (event == null || event.isRouteUpdate()) {
+                                                                return null;
+                                                            }
+                                                            return event.getMessage() == null
+                                                                    ? null
+                                                                    : event.getMessage()
+                                                                            .getBytes(StandardCharsets.UTF_8);
+                                                        })
+                                        .build())
+                        .setDeliveryGuarantee(deliveryGuarantee)
+                        .setProperties(properties);
+        if (deliveryGuarantee == DeliveryGuarantee.EXACTLY_ONCE
+                && transactionalIdPrefix != null
+                && !transactionalIdPrefix.isBlank()) {
+            builder.setTransactionalIdPrefix(transactionalIdPrefix);
+        }
+        return builder.build();
     }
 }

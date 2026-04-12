@@ -1,0 +1,17 @@
+dynamic:
+  cluster_id: default-cluster
+  topic: exp-exactly-once
+  stream_pattern: "^exp-wjh-eo.*$"
+  bootstrap_servers: localhost:9092
+  emit_interval_ms: 10
+  parallelism: 1
+  discovery_interval_ms: 2000
+  route_map:
+    route-a:
+      cluster_id: default-cluster
+      bootstrap_servers: localhost:9092
+      topic_regex: "^exp-eo-a$"
+    route-b:
+      cluster_id: default-cluster
+      bootstrap_servers: localhost:9092
+      topic_regex: "^exp-eo-b$"

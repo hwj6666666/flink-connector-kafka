@@ -6,6 +6,7 @@ import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.source.util.ratelimit.RateLimiterStrategy;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.datagen.source.DataGeneratorSource;
 import org.apache.flink.connector.datagen.source.GeneratorFunction;
 import org.apache.flink.connector.kafka.sink.KafkaRouteDestination;
@@ -33,6 +34,7 @@ public class DynamicJob {
     private static final int EIGHT_DIGIT_BOUND = 100_000_000;
     private static final long DEFAULT_INTERVAL_MS = 0L;
     private static final long DEFAULT_DISCOVERY_INTERVAL_MS = 2000L;
+    private static final long DEFAULT_CHECKPOINT_INTERVAL_MS = 0L;
     private static final int DEFAULT_PARALLELISM = 1;
     private static final String DEFAULT_CONFIG_FILE = "config.yaml";
     private static final DateTimeFormatter TIMESTAMP_FORMATTER =
@@ -53,9 +55,23 @@ public class DynamicJob {
                         parameters.getOrDefault(
                                 "discovery-interval-ms",
                                 String.valueOf(DEFAULT_DISCOVERY_INTERVAL_MS)));
+        long checkpointIntervalMs =
+                Long.parseLong(
+                        parameters.getOrDefault(
+                                "checkpoint-interval-ms",
+                                String.valueOf(DEFAULT_CHECKPOINT_INTERVAL_MS)));
+        DeliveryGuarantee deliveryGuarantee =
+                DeliveryGuarantee.valueOf(
+                        parameters
+                                .getOrDefault("delivery-guarantee", DeliveryGuarantee.AT_LEAST_ONCE.name())
+                                .toUpperCase());
+        String transactionalIdPrefix = parameters.get("transactional-id-prefix");
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
+        if (checkpointIntervalMs > 0) {
+            env.enableCheckpointing(checkpointIntervalMs);
+        }
 
         Map<String, KafkaRouteDestination> routeMap =
                 loadRouteMapFromYaml(configFile, clusterId, bootstrapServers);
@@ -87,7 +103,9 @@ public class DynamicJob {
                                         bootstrapServers,
                                         clusterId,
                                         streamPattern,
-                                        discoveryIntervalMs))
+                                        discoveryIntervalMs,
+                                        deliveryGuarantee,
+                                        transactionalIdPrefix))
                 .name("dynamic-kafka-sink-id-routing");
 
         env.execute("Dynamic Sink Benchmark Job");

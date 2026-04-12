@@ -1,0 +1,23 @@
+dynamic:
+  cluster_id: default-cluster
+  topic: exp-dynamic
+  stream_pattern: "^exp-wjh.*$"
+  bootstrap_servers: localhost:9092
+  emit_interval_ms: 20
+  parallelism: 1
+  discovery_interval_ms: 2000
+  route_map:
+    route-a:
+      cluster_id: default-cluster
+      bootstrap_servers: localhost:9092
+      topic_regex: "^exp-dynamic-a$"
+    route-b:
+      cluster_id: default-cluster
+      bootstrap_servers: localhost:9092
+      topic_regex: "^exp-dynamic-b$"
+
+regular:
+  topic: exp-regular
+  bootstrap_servers: localhost:9092
+  emit_interval_ms: 20
+  parallelism: 1
