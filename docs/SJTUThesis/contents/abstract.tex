@@ -10,14 +10,13 @@
   本文围绕“基于 Flink 的动态 Kafka Topic 发现与订阅机制”展开研究。首先，从统一 Sink API、
   Kafka 元数据访问与静态 KafkaSink 的使用方式出发，分析其在动态写入场景下的局限；
   其次，提出基于正则表达式的 Topic 发现方案，以及逻辑路由与物理路由分离的设计思路；
-  在此基础上，依托现有代码实现了 DynamicKafkaSink、DynamicKafkaSinkWriter、
-  SingleClusterTopicMetadataService、DynamicKafkaSinkWriterState、DynamicKafkaCommittable
-  与 DynamicKafkaCommitter 等关键组件，并通过广播状态与 route 更新事件支持运行期动态路由。
-  该原型能够在不重启 Flink 作业的前提下发现符合规则的 Topic、建立对应写入路径，并完成多目标写入与 route 级状态记录。
+  在此基础上，依托现有代码实现了元数据发现、运行时路由、写入器管理、状态快照和提交协调等关键模块，
+  并通过广播状态与路由更新事件支持运行期动态路由。
+  该原型能够在不重启 Flink 作业的前提下发现符合规则的 Topic、建立对应写入路径，并完成多目标写入与路由级状态记录。
 
-  目前，系统已在本地环境完成基本功能验证，验证了动态 Topic 发现、显式 route 更新与多目标写入机制的可行性。
-  同时，本文也对当前实现中的局限进行了分析，包括元数据轮询开销、失效 route 的 writer 回收不足、
-  Exactly-once 路径验证仍需完善等问题。后续工作将围绕元数据访问优化、资源管理
+  目前，系统已在本地环境完成基本功能验证，验证了动态 Topic 发现、显式路由更新与多目标写入机制的可行性。
+  同时，本文也对当前实现中的局限进行了分析，包括元数据轮询开销、失效路由的写入通道回收不足、
+  exactly-once 路径验证仍需完善等问题。后续工作将围绕元数据访问优化、资源管理
   及更完整的对比实验继续推进。
 \end{abstract}
 
@@ -27,8 +26,8 @@
 \begin{abstract}[en]
   With the wide adoption of cloud-native and event-driven architectures, Apache Flink and Apache Kafka have become a common combination for building real-time data pipelines. Existing Flink Kafka sinks, however, usually rely on static configurations: the target topic and connection properties are fixed when the job starts. When downstream Kafka topology changes because of expansion, migration, disaster recovery, or business evolution, the job often has to be stopped, reconfigured, and redeployed, which increases operational cost and weakens the continuity of real-time pipelines.
 
-  This thesis studies a dynamic Kafka topic discovery and subscription mechanism based on Flink. It analyzes the limitations of static KafkaSink usage under the unified Sink API, and designs a topic discovery approach based on regular expressions together with a separation between logical routes and physical Kafka topics. Based on the existing codebase, this work implements core components such as \id{DynamicKafkaSink}, \id{DynamicKafkaSinkWriter}, \id{SingleClusterTopicMetadataService}, \id{DynamicKafkaSinkWriterState}, \id{DynamicKafkaCommittable}, and \id{DynamicKafkaCommitter}. The prototype supports runtime route updates through broadcast state and route update events, and can discover matching topics, establish corresponding write paths, and perform multi-target writes without restarting the Flink job.
+  This thesis studies a dynamic Kafka topic discovery and subscription mechanism based on Flink. It analyzes the limitations of static Kafka Sink usage under the unified Sink API, and designs a topic discovery approach based on regular expressions together with a separation between logical routes and physical Kafka topics. Based on the existing codebase, this work implements key modules for metadata discovery, runtime routing, write-channel management, state snapshotting, and commit coordination. The prototype supports runtime route updates through broadcast state, and can discover matching topics, establish corresponding write paths, and perform multi-target writes without restarting the Flink job.
 
-  Experiments in a local environment validate the feasibility of dynamic topic discovery, explicit route updates, multi-target writes, Checkpoint coordination, and the small-scale transaction path. The thesis also discusses current limitations, including metadata polling overhead, route writer cleanup under \id{EXACTLY_ONCE}, and the need for more complete local validation. Future work will focus on metadata access optimization, resource management, and more comprehensive comparative evaluation.
+  Experiments in a local environment validate the feasibility of dynamic topic discovery, explicit route updates, multi-target writes, Checkpoint coordination, and the small-scale transaction path. The thesis also discusses current limitations, including metadata polling overhead, retired write-channel cleanup under exactly-once semantics, and the need for more complete local validation. Future work will focus on metadata access optimization, resource management, and more comprehensive comparative evaluation.
 \end{abstract}
 }

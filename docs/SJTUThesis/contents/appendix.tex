@@ -9,9 +9,9 @@
 为了避免在正文中反复插入过多配置细节，本文将实验所用的典型配置整理于本附录。
 这些配置仅用于驱动 connector 的验证，并不改变 connector 本身的设计与语义。
 
-\subsection{显式 route 与静态基线实验配置}
+\subsection{显式路由与静态基线实验配置}
 
-\begin{codeblock}[caption={用于显式 route 与静态基线实验的配置样例}]
+\begin{codeblock}[caption={用于显式路由与静态基线实验的配置样例}]
 dynamic:
   cluster_id: default-cluster
   topic: exp-dynamic
@@ -39,9 +39,8 @@ regular:
 
 \subsection{发现实时性实验配置}
 
-发现实时性实验没有依赖显式 route map，而是使用 \id{AutoDiscoveryJob}
-生成不携带 \id{routeId} 的数据记录，并通过 \id{stream_pattern} 驱动
-\id{DynamicKafkaSinkWriter.refreshRouteIfNeeded(...)} 进行 route 刷新。对应命令中使用的关键参数为：
+发现实时性实验没有依赖显式 route map，而是使用自动发现实验入口生成不携带路由标识的数据记录，
+并通过 \id{stream_pattern} 驱动元数据刷新与路由集合更新。对应命令中使用的关键参数为：
 \id{bootstrap-servers=localhost:9092}、
 \id{cluster-id=default-cluster}、
 \texttt{stream-pattern=\^{}exp-auto-.*\$}、
@@ -66,27 +65,25 @@ regular:
 \end{codeblock}
 
 \begin{codeblock}[language=bash,caption={发现实时性实验的核心执行命令示意}]
-java -cp app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar \
-  org.apache.flink.dynamic.sink.job.AutoDiscoveryJob \
-  --bootstrap-servers localhost:9092 \
-  --stream-pattern '^exp-auto-.*$' \
-  --cluster-id default-cluster \
-  --emit-interval-ms 50 \
-  --parallelism 1 \
-  --discovery-interval-ms 2000
+# 自动发现实验入口；以下为关键运行参数
+--bootstrap-servers localhost:9092
+--stream-pattern '^exp-auto-.*$'
+--cluster-id default-cluster
+--emit-interval-ms 50
+--parallelism 1
+--discovery-interval-ms 2000
 \end{codeblock}
 
 \begin{codeblock}[language=bash,caption={Checkpoint 协同与事务路径可运行性验证命令示意}]
-java -cp app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar \
-  org.apache.flink.dynamic.sink.job.DynamicJob \
-  --bootstrap-servers localhost:9092 \
-  --stream-pattern '^exp-wjh-eo.*$' \
-  --cluster-id default-cluster \
-  --emit-interval-ms 10 \
-  --parallelism 1 \
-  --discovery-interval-ms 2000 \
-  --checkpoint-interval-ms 5000 \
-  --delivery-guarantee EXACTLY_ONCE \
-  --transactional-id-prefix thesis-eo-demo \
-  --config-file config.experiment.exactly_once.yaml
+# 动态写入实验入口；以下为关键运行参数
+--bootstrap-servers localhost:9092
+--stream-pattern '^exp-wjh-eo.*$'
+--cluster-id default-cluster
+--emit-interval-ms 10
+--parallelism 1
+--discovery-interval-ms 2000
+--checkpoint-interval-ms 5000
+--delivery-guarantee exactly-once
+--transactional-id-prefix thesis-eo-demo
+--config-file config.experiment.exactly_once.yaml
 \end{codeblock}

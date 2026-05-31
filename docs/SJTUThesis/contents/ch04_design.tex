@@ -9,38 +9,97 @@
 因此，本章不再重复说明“为什么需要动态 Sink”，而是回答“如何把这些需求转化为一套可运行、可恢复、可验证的连接器设计”。
 
 从需求到设计的关键转化在于：动态 Kafka Sink 不能只在静态 \id{KafkaSink} 外层增加一个正则判断。
-如果只解决 Topic 发现，数据仍不知道应该写向哪个 writer；如果只解决逻辑 route 映射，新 Topic 仍无法进入可写集合；
+如果只解决 Topic 发现，数据仍不知道应该写向哪个写入通道；如果只解决逻辑路由映射，新 Topic 仍无法进入可写集合；
 如果绕开 Flink Sink API 手动管理 Kafka producer，又会失去 Checkpoint 与事务提交链路。
-因此，本章采用“动态外壳 + 静态内核”的思路：外层负责 Topic 元数据刷新、route 解析、writer 生命周期和状态包装；
-内层继续复用成熟的 KafkaSink writer、状态与提交能力。
+因此，本章采用“动态外壳 + 静态内核”的思路：外层负责 Topic 元数据刷新、路由解析、写入通道生命周期和状态包装；
+内层继续复用成熟的 Kafka 写入、状态与提交能力。
 
 \section{总体架构设计}
 
 \subsection{架构层次}
 
 系统总体上划分为四个层次。第一层是配置与构建层，负责把 \id{streamPattern}、元数据服务、序列化器和投递语义转化为动态 Sink 实例。
-第二层是元数据发现层，负责通过 Kafka 管理面获取当前可见 Topic，并把 Topic 集合封装为统一的 \id{KafkaStream} 抽象。
-第三层是运行时路由层，负责把自动发现结果或显式逻辑 route 解析为物理 route，并按 route 懒创建底层 writer。
-第四层是状态与提交层，负责把 route 级 writer 状态纳入 Flink Checkpoint，并在提交阶段按 route 分发 committable。
+第二层是元数据发现层，负责通过 Kafka 管理面获取当前可见 Topic，并把 Topic 集合封装为统一的内部元数据。
+第三层是运行时路由层，负责把自动发现结果或显式逻辑路由解析为物理路由，并按路由懒创建底层写入通道。
+第四层是状态与提交层，负责把路由级写入状态纳入 Flink Checkpoint，并在提交阶段按路由分发提交对象。
 
 这一层次划分对应第三章的问题链条：先发现目标，再决定目标，再维护写入通道，最后保证通道状态可恢复。
-应用层作业只作为验证载体，负责产生测试数据与 route 更新控制事件，不承担 connector 内部的动态写入语义。
+应用层作业只作为验证载体，负责产生测试数据与路由更新控制事件，不承担 connector 内部的动态写入语义。
 
-\begin{figure}[htbp]
+\begin{figure}[H]
   \centering
-  \safeincludegraphics[width=0.92\textwidth]{dynamic_sink_architecture.png}
+  \begin{tikzpicture}[
+    node distance=0.42cm and 1.05cm,
+    box/.style={draw, rounded corners=2pt, align=center, minimum width=2.35cm, minimum height=0.62cm, fill=gray!8, font=\small},
+    arrow/.style={-Latex, thick}
+  ]
+    \node[box] (cfg) {配置与控制事件\\正则、路由映射};
+    \node[box, below=of cfg] (data) {业务数据流\\携带或不携带路由};
+    \node[box, right=of cfg] (entry) {动态写入入口\\区分控制面与数据面};
+    \node[box, right=of entry] (meta) {元数据发现\\查询 Topic 集合};
+    \node[box, right=of meta] (match) {模式匹配\\筛选候选目标};
+    \node[box, below=of meta] (route) {运行时路由\\解析物理目标};
+    \node[box, right=of route] (writer) {写入通道管理\\懒创建与复用};
+    \node[box, right=of writer] (topic) {Kafka Topic\\多目标写出};
+    \node[box, below=of route] (state) {路由级状态\\进入 Checkpoint};
+    \node[box, right=of state] (commit) {提交协调\\按路由分组};
+
+    \draw[arrow] (cfg) -- (entry);
+    \draw[arrow] (data) -- (entry);
+    \draw[arrow] (entry) -- (meta);
+    \draw[arrow] (meta) -- (match);
+    \draw[arrow] (match) |- (route);
+    \draw[arrow] (route) -- (writer);
+    \draw[arrow] (writer) -- (topic);
+    \draw[arrow] (route) -- (state);
+    \draw[arrow] (state) -- (commit);
+  \end{tikzpicture}
   \caption{动态 Kafka Sink 总体架构示意（区分数据流、控制流与依赖关系）}
   \label{fig:dynamic-sink-architecture}
 \end{figure}
 
 图~\ref{fig:dynamic-sink-architecture} 展示的是系统总体架构，而不是单一方法调用图。
-其中，业务数据与 route 更新事件属于运行期流动关系，表示记录和控制事件如何进入 Sink 并触发写入；
-构建器、元数据服务、订阅器与底层 \id{KafkaSink} 之间属于依赖或组合关系，表示组件之间的持有和调用；
-Checkpoint state 与 committable 属于状态/提交关系，表示运行期结果如何进入 Flink 容错与提交链路。
+其中，业务数据与路由更新事件属于运行期流动关系，表示记录和控制事件如何进入 Sink 并触发写入；
+构建器、元数据服务、订阅器与底层 Kafka 写入能力之间属于依赖或组合关系，表示组件之间的持有和调用；
+Checkpoint 状态与提交对象属于状态/提交关系，表示运行期结果如何进入 Flink 容错与提交链路。
 
-\begin{figure}[htbp]
+\begin{figure}[H]
   \centering
-  \safeincludegraphics[width=\textwidth]{dynamic_sink_call_graph.png}
+  \begin{tikzpicture}[
+    node distance=0.35cm and 1.05cm,
+    lane/.style={font=\small\bfseries, align=right},
+    box/.style={draw, rounded corners=2pt, align=center, minimum width=2.25cm, minimum height=0.58cm, fill=gray!8, font=\small},
+    arrow/.style={-Latex, thick}
+  ]
+    \node[lane] (l1) {应用层验证载体};
+    \node[box, right=0.75cm of l1] (cfg) {读取实验配置};
+    \node[box, right=of cfg] (event) {生成数据事件};
+    \node[box, right=of event] (broadcast) {广播路由更新\\放行有效数据};
+
+    \node[lane, below=0.55cm of l1] (l2) {连接器构建层};
+    \node[box, right=0.75cm of l2] (builder) {装配正则\\序列化与语义};
+    \node[box, right=of builder] (sink) {生成动态\\写入实例};
+
+    \node[lane, below=0.55cm of l2] (l3) {Sink 运行时核心};
+    \node[box, right=0.75cm of l3] (refresh) {刷新元数据};
+    \node[box, right=of refresh] (resolve) {解析逻辑路由};
+    \node[box, right=of resolve] (channel) {创建或复用\\写入通道};
+    \node[box, right=of channel] (kafka) {写入 Kafka Topic};
+
+    \node[lane, below=0.55cm of l3] (l4) {状态与提交路径};
+    \node[box, right=0.75cm of l4] (snapshot) {路由级\\状态快照};
+    \node[box, right=of snapshot] (wrap) {预提交对象\\包装};
+    \node[box, right=of wrap] (submit) {按路由\\提交};
+
+    \draw[arrow] (cfg) -- (event);
+    \draw[arrow] (event) -- (broadcast);
+    \draw[arrow] (builder) -- (sink);
+    \draw[arrow] (refresh) -- (resolve);
+    \draw[arrow] (resolve) -- (channel);
+    \draw[arrow] (channel) -- (kafka);
+    \draw[arrow] (snapshot) -- (wrap);
+    \draw[arrow] (wrap) -- (submit);
+  \end{tikzpicture}
   \caption{动态 Sink 分层调用关系与状态提交路径}
   \label{fig:dynamic-sink-call-graph}
 \end{figure}
@@ -63,13 +122,13 @@ Checkpoint state 与 committable 属于状态/提交关系，表示运行期结�
     \midrule
     新 Topic 在秒级被发现 & 周期轮询 Topic 元数据，并配置刷新间隔 &
     Kafka 缺少适合 Sink 端直接订阅的 Topic 变更事件，周期轮询实现简单且发现上界可由配置控制。 \\
-    小规模动态路由吞吐接近静态基线 & route 解析缓存，底层写入器懒创建并复用 &
+    小规模动态路由吞吐接近静态基线 & 路由解析缓存，底层写入通道懒创建并复用 &
     避免每条记录都重新创建 producer，同时复用成熟写入路径以减少额外开销。 \\
-    逻辑 route 可运行期更新 & 广播状态传递控制事件 + Sink 内部维护逻辑 route 表 &
+    逻辑路由可运行期更新 & 广播状态传递控制事件 + Sink 内部维护逻辑路由表 &
     广播状态保证并行实例收到一致配置，Sink 内部表保证控制事件能影响后续写入。 \\
-    Checkpoint 协同与事务路径可运行性 & route 级状态、待提交对象和提交器 &
-    动态 route 不能脱离 Flink 容错体系，提交对象必须携带 route 元数据才能分组恢复和提交。 \\
-    route 变化下资源可控 & 非事务路径清理退役写入器，事务路径保守保留 &
+    Checkpoint 协同与事务路径可运行性 & 路由级状态、待提交对象和提交协调器 &
+    动态路由不能脱离 Flink 容错体系，提交对象必须携带路由元数据才能分组恢复和提交。 \\
+    路由变化下资源可控 & 非事务路径清理退役写入通道，事务路径保守保留 &
     在资源回收和事务安全之间取折中，避免事务路径下过早关闭仍可能参与提交的写入器。 \\
     \bottomrule
   \end{tabularx}
@@ -77,9 +136,9 @@ Checkpoint state 与 committable 属于状态/提交关系，表示运行期结�
 
 \section{核心算法与流程设计}
 
-\subsection{动态发现与 route 解析流程}
+\subsection{动态发现与路由解析流程}
 
-动态发现流程的输入是 Kafka 集群当前 Topic 集合和用户配置的 \id{streamPattern}，输出是可写的物理 route 集合。
+动态发现流程的输入是 Kafka 集群当前 Topic 集合和用户配置的 \id{streamPattern}，输出是可写的物理路由集合。
 该流程不关心 Topic 内部分区如何分配，而只决定“哪些 Topic 需要被纳入 Sink 写入目标”。
 
 \begin{table}[htbp]
@@ -93,60 +152,60 @@ Checkpoint state 与 committable 属于状态/提交关系，表示运行期结�
     1 & 判断是否到达元数据刷新时间 & 通过 \id{discovery_interval_ms} 控制刷新上界，支撑第三章的 3 秒发现目标。 \\
     2 & 查询 Kafka 当前 Topic 集合 & 以 Kafka 管理面状态作为动态发现的事实来源。 \\
     3 & 使用正则筛选命中 Topic & 将动态增长的 Topic 集合转化为可配置规则描述的目标集合。 \\
-    4 & 为每个命中 Topic 构造物理 route & route id 由 cluster、topic 与连接信息共同确定，便于后续状态和提交分组。 \\
-    5 & 懒创建缺失 writer & 避免刷新时重建全部 writer，降低主写入路径开销。 \\
-    6 & 更新活动 route 集合并清理退役 writer & 保证新增 Topic 可写，同时在非事务路径下控制历史 writer 累积。 \\
+    4 & 为每个命中 Topic 构造物理路由 & 路由标识由集群、Topic 与连接信息共同确定，便于后续状态和提交分组。 \\
+    5 & 懒创建缺失写入通道 & 避免刷新时重建全部通道，降低主写入路径开销。 \\
+    6 & 更新活动路由集合并清理退役通道 & 保证新增 Topic 可写，同时在非事务路径下控制历史通道累积。 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-该流程采用“全量重算活动集合 + 惰性创建缺失 writer + 条件清理退役 writer”的策略。
-全量重算降低了差分维护复杂度，适合本文 2 到 4 个 route 的原型验证范围；惰性创建避免每次刷新都重建底层 Kafka writer；
+该流程采用“全量重算活动集合 + 惰性创建缺失写入通道 + 条件清理退役写入通道”的策略。
+全量重算降低了差分维护复杂度，适合本文 2 到 4 个路由的原型验证范围；惰性创建避免每次刷新都重建底层 Kafka 写入通道；
 条件清理则在资源治理和事务安全之间保持折中。
 
 \subsection{主写入流程}
 
-运行时写入入口需要同时处理普通数据和 route 更新事件。本文没有为控制面与数据面建立完全独立的外部通道，
-而是允许 route 更新事件与普通数据共同进入 Sink，再由 Writer 根据事件类型分流。
+运行时写入入口需要同时处理普通数据和路由更新事件。本文没有为控制面与数据面建立完全独立的外部通道，
+而是允许路由更新事件与普通数据共同进入 Sink，再由写入执行模块根据事件类型分流。
 这样可以使配置变化和后续写入处在同一条执行链路中，便于保证“先更新、后使用”的时序关系。
 
 \begin{table}[htbp]
   \centering
-  \caption{Writer 主写入流程的伪代码表达}
+  \caption{主写入流程的伪代码表达}
   \label{tab:writer-main-flow}
   \begin{tabular}{p{0.16\textwidth}p{0.36\textwidth}p{0.36\textwidth}}
     \toprule
     输入类型 & 处理流程 & 输出结果 \\
     \midrule
-    route 更新事件 & 更新逻辑 route 表；清除对应解析缓存；必要时触发退役 writer 检查 & 后续数据使用新的 route 配置 \\
-    携带 route id 的数据事件 & 查找逻辑 route；若缓存不存在则解析物理 route；向解析出的 writer 写入 & 数据按业务 route 分发到目标 Topic \\
-    不携带 route id 的普通事件 & 检查是否需要刷新元数据；遍历当前活动 route 集合；向所有活动 writer 写入 & 数据写入自动发现路径下的全部目标 \\
+    路由更新事件 & 更新逻辑路由表；清除对应解析缓存；必要时触发退役通道检查 & 后续数据使用新的路由配置 \\
+    携带路由标识的数据事件 & 查找逻辑路由；若缓存不存在则解析物理路由；向解析出的通道写入 & 数据按业务路由分发到目标 Topic \\
+    不携带路由标识的普通事件 & 检查是否需要刷新元数据；遍历当前活动路由集合；向所有活动通道写入 & 数据写入自动发现路径下的全部目标 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-这一流程体现了本文的两个核心语义：其一，显式逻辑 route 用于业务分流；
-其二，自动发现路径默认具有 fan-out 语义，即普通记录会写入所有当前活动 route。
+这一流程体现了本文的两个核心语义：其一，显式逻辑路由用于业务分流；
+其二，自动发现路径默认具有 fan-out 语义，即普通记录会写入所有当前活动路由。
 后者适合“所有匹配 Topic 都应接收同类数据”的验证场景，但在生产化扩展时可以进一步引入更细粒度的路由函数。
 
-\subsection{route 生命周期状态转移}
+\subsection{路由生命周期状态转移}
 
-动态 Sink 的关键不是一次性解析 route，而是在作业运行期持续维护 route 的生命周期。
-本文将 route 生命周期抽象为五类状态，如表~\ref{tab:route-lifecycle} 所示。
+动态 Sink 的关键不是一次性解析路由，而是在作业运行期持续维护路由的生命周期。
+本文将路由生命周期抽象为五类状态，如表~\ref{tab:route-lifecycle} 所示。
 
 \begin{table}[htbp]
   \centering
-  \caption{route 生命周期状态转移}
+  \caption{路由生命周期状态转移}
   \label{tab:route-lifecycle}
   \begin{tabular}{p{0.16\textwidth}p{0.30\textwidth}p{0.40\textwidth}}
     \toprule
     状态 & 触发条件 & 处理逻辑 \\
     \midrule
-    未发现 & Topic 不存在或未匹配正则 & 不创建 writer，不参与写入和快照。 \\
-    已发现 & 元数据刷新后命中正则 & 生成物理 route 描述，等待写入时懒创建 writer。 \\
-    活跃 & writer 已创建且 route 被活动集合或逻辑 route 引用 & 接收数据写入，并在 Checkpoint 时输出 route 级状态。 \\
-    退役候选 & route 不再属于活动集合，且不再被显式逻辑 route 引用 & \id{NONE} 与 \id{AT_LEAST_ONCE} 路径允许清理；\id{EXACTLY_ONCE} 路径保守保留。 \\
-    已清理 & 非事务路径下 writer 已关闭并从内部表移除 & 不再接收写入，后续若重新发现则重新进入已发现状态。 \\
+    未发现 & Topic 不存在或未匹配正则 & 不创建写入通道，不参与写入和快照。 \\
+    已发现 & 元数据刷新后命中正则 & 生成物理路由描述，等待写入时懒创建通道。 \\
+    活跃 & 写入通道已创建且路由被活动集合或逻辑路由引用 & 接收数据写入，并在 Checkpoint 时输出路由级状态。 \\
+    退役候选 & 路由不再属于活动集合，且不再被显式逻辑路由引用 & 无事务与至少一次路径允许清理；精准一次路径保守保留。 \\
+    已清理 & 非事务路径下写入通道已关闭并从内部表移除 & 不再接收写入，后续若重新发现则重新进入已发现状态。 \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -166,121 +225,120 @@ Checkpoint state 与 committable 属于状态/提交关系，表示运行期结�
     \node[state, left=1.8cm of retired] (cleaned) {已清理};
 
     \draw[trans] (missing) -- node[note, above] {Topic 命中正则} (discovered);
-    \draw[trans] (discovered) -- node[note, above] {首次写入\\懒创建 writer} (active);
-    \draw[trans] (active) -- node[note, right] {route 不再被引用} (retired);
-    \draw[trans] (retired) -- node[note, below] {非事务路径\\关闭 writer} (cleaned);
+    \draw[trans] (discovered) -- node[note, above] {首次写入\\懒创建通道} (active);
+    \draw[trans] (active) -- node[note, right] {路由不再被引用} (retired);
+    \draw[trans] (retired) -- node[note, below] {非事务路径\\关闭通道} (cleaned);
     \draw[trans] (cleaned) -- node[note, left] {再次发现} (discovered);
-    \draw[trans, dashed] (retired.east) -- ++(1.1,0) |- node[note, right] {\id{EXACTLY\_ONCE}\\保守保留} (active.east);
+    \draw[trans, dashed] (retired.east) -- ++(1.1,0) |- node[note, right] {精准一次\\保守保留} (active.east);
   \end{tikzpicture}
-  \caption{route 生命周期状态转移图}
+  \caption{路由生命周期状态转移图}
   \label{fig:route-lifecycle-state}
 \end{figure}
 
-图~\ref{fig:route-lifecycle-state} 进一步说明了为何当前实现没有在 \id{EXACTLY_ONCE} 模式下立即清理退役 writer。
-事务型 writer 可能仍持有与未完成 Checkpoint 相关的事务上下文，过早关闭会扩大一致性风险。
+图~\ref{fig:route-lifecycle-state} 进一步说明了为何当前实现没有在精准一次模式下立即清理退役写入通道。
+事务型写入通道可能仍持有与未完成 Checkpoint 相关的事务上下文，过早关闭会扩大一致性风险。
 因此，本文先在非事务路径形成生命周期闭环，把事务路径安全清理作为后续工程化工作。
 
-\subsection{逻辑 route 与物理 Topic 映射}
+\subsection{逻辑路由与物理 Topic 映射}
 
 第三章指出，业务记录不应直接绑定物理 Topic，否则 Topic 拆分、迁移或灰度切换仍会传导到上游业务逻辑。
-因此，本文引入逻辑 route 与物理 Topic 的两级映射：业务事件只携带 route id；
-route id 对应一个包含 Kafka 集群、连接地址和 Topic 正则的目标描述；
+因此，本文引入逻辑路由与物理 Topic 的两级映射：业务事件只携带路由标识；
+路由标识对应一个包含 Kafka 集群、连接地址和 Topic 正则的目标描述；
 目标描述再在运行时解析为一个或多个物理 Topic。
 
 这一模型可以表示为，其中 \(d\) 表示由集群标识、连接地址和 Topic 正则组成的目标描述：
 \[
   \begin{aligned}
-    routeId &\rightarrow d \\
+    \text{路由标识} &\rightarrow d \\
     d &\rightarrow \{topic_i \mid 1 \leq i \leq n\}
   \end{aligned}
 \]
 
-当一个正则只命中单个 Topic 时，逻辑 route 表现为普通的一对一分流；
-当一个正则命中多个 Topic 时，逻辑 route 会扩展为一对多写入。
+当一个正则只命中单个 Topic 时，逻辑路由表现为普通的一对一分流；
+当一个正则命中多个 Topic 时，逻辑路由会扩展为一对多写入。
 因此，正则不仅是发现规则，也是 fan-out 范围的边界。
 本文实验中采用锚定正则，如 \texttt{\^{}exp-dynamic-c\$}，以降低误命中和写放大风险。
 
 \section{状态与提交流程设计}
 
-\subsection{route 级状态组织}
+\subsection{路由级状态组织}
 
-动态 Sink 不能只保存一个全局 Topic 集合。Checkpoint 到来时，系统需要知道每个物理 route 对应的底层 writer 处于什么状态，
+动态 Sink 不能只保存一个全局 Topic 集合。Checkpoint 到来时，系统需要知道每个物理路由对应的底层写入通道处于什么状态，
 否则恢复后无法继续处理故障前已经进入写入或事务路径的数据。
-因此，本文把状态组织为 route 级恢复单元，每个恢复单元至少包含 route 标识、Kafka 集群、Topic、事务前缀、producer 配置和底层 writer 状态。
+因此，本文把状态组织为路由级恢复单元，每个恢复单元至少包含路由标识、Kafka 集群、Topic、事务前缀、producer 配置和底层写入状态。
 
 \begin{table}[htbp]
   \centering
-  \caption{route 级状态快照流程}
+  \caption{路由级状态快照流程}
   \label{tab:checkpoint-flow}
   \begin{tabular}{p{0.12\textwidth}p{0.38\textwidth}p{0.38\textwidth}}
     \toprule
     步骤 & 处理动作 & 设计目的 \\
     \midrule
-    1 & Checkpoint 触发时刷新必要的 route 信息 & 避免快照时状态与当前可写集合明显脱节。 \\
-    2 & 遍历已存在的物理 route writer & 以实际写入通道为单位组织恢复状态。 \\
-    3 & 获取底层 Kafka writer 状态 & 复用 KafkaSink 已有的状态语义。 \\
-    4 & 封装为动态 Sink 的 route 级状态 & 把 route 元数据与底层状态绑定，便于恢复时重建 writer。 \\
-    5 & 恢复时先重建历史 route，再强制刷新元数据 & 同时保留 Checkpoint 状态和运行期 Topic 变化适配能力。 \\
+    1 & Checkpoint 触发时刷新必要的路由信息 & 避免快照时状态与当前可写集合明显脱节。 \\
+    2 & 遍历已存在的物理路由写入通道 & 以实际写入通道为单位组织恢复状态。 \\
+    3 & 获取底层 Kafka 写入状态 & 复用 KafkaSink 已有的状态语义。 \\
+    4 & 封装为动态 Sink 的路由级状态 & 把路由元数据与底层状态绑定，便于恢复时重建写入通道。 \\
+    5 & 恢复时先重建历史路由，再强制刷新元数据 & 同时保留 Checkpoint 状态和运行期 Topic 变化适配能力。 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-这一设计对应第三章的 Checkpoint 协同需求：动态 route 状态不是游离在 Flink 容错体系之外的临时缓存，
+这一设计对应第三章的 Checkpoint 协同需求：动态路由状态不是游离在 Flink 容错体系之外的临时缓存，
 而是通过统一 Sink API 进入正式的快照与恢复链路。
 
 \subsection{Exactly-once 提交流程}
 
-\id{EXACTLY_ONCE} 路径的难点在于动态 route 会让事务上下文随目标数量变化。
-如果所有 route 共用同一事务前缀，不同目标之间的事务边界容易混淆；
-如果完全重写事务 producer，又会破坏复用底层 KafkaSink 的设计目标。
-因此，本文采用 route 级事务与提交包装：每个物理 route 派生自己的事务前缀，
-Writer 在 \id{prepareCommit()} 阶段把底层 \id{KafkaCommittable} 包装为带 route 信息的动态 committable，
-Committer 再按 route 分组提交。
+精准一次路径的难点在于动态路由会让事务上下文随目标数量变化。
+如果所有路由共用同一事务前缀，不同目标之间的事务边界容易混淆；
+如果完全重写事务 producer，又会破坏复用底层 Kafka 写入能力的设计目标。
+因此，本文采用路由级事务与提交包装：每个物理路由派生自己的事务前缀，
+预提交阶段把底层提交结果包装为带路由信息的动态提交对象，提交协调阶段再按路由分组提交。
 
 \begin{table}[htbp]
   \centering
-  \caption{Exactly-once route 级提交流程}
+  \caption{Exactly-once 路由级提交流程}
   \label{tab:exactly-once-flow}
   \begin{tabular}{p{0.12\textwidth}p{0.38\textwidth}p{0.38\textwidth}}
     \toprule
     阶段 & 处理动作 & 设计目的 \\
     \midrule
     构建 & 要求用户提供全局事务前缀 & 避免事务型 Sink 缺少稳定命名空间。 \\
-    写入 & 为每个物理 route 派生 route 级事务前缀 & 隔离不同 route 的事务上下文。 \\
-    预提交 & 将底层 Kafka committable 包装为动态 committable & 提交对象携带 route 元数据，便于后续分组。 \\
-    提交 & 按 route id 聚合提交请求，并委托对应 Kafka committer & 保持 route 级提交边界，复用底层 KafkaSink 提交能力。 \\
-    回收 & \id{EXACTLY_ONCE} 路径暂不自动清理退役 writer & 避免过早关闭仍可能参与事务完成的 writer。 \\
+    写入 & 为每个物理路由派生路由级事务前缀 & 隔离不同路由的事务上下文。 \\
+    预提交 & 将底层 Kafka 提交对象包装为动态提交对象 & 提交对象携带路由元数据，便于后续分组。 \\
+    提交 & 按路由标识聚合提交请求，并委托对应 Kafka 提交器 & 保持路由级提交边界，复用底层 Kafka Sink 提交能力。 \\
+    回收 & 精准一次路径暂不自动清理退役写入通道 & 避免过早关闭仍可能参与事务完成的通道。 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\begin{figure}[htbp]
+\begin{figure}[H]
   \centering
   \begin{tikzpicture}[
     >=Stealth,
-    lifeline/.style={draw, rounded corners, align=center, minimum width=2.2cm, minimum height=0.75cm, fill=gray!8},
+    lifeline/.style={draw, rounded corners, align=center, minimum width=2.05cm, minimum height=0.68cm, fill=gray!8},
     msg/.style={->, thick},
     returnmsg/.style={->, dashed, thick},
     lab/.style={font=\small, align=center}
   ]
-    \node[lifeline] (writer) at (0,0) {Writer};
-    \node[lifeline] (kwriter) at (3.2,0) {Kafka writer};
-    \node[lifeline] (comm) at (6.4,0) {动态 Committer};
-    \node[lifeline] (kcomm) at (9.6,0) {Kafka committer};
+    \node[lifeline] (writer) at (0,0) {写入执行};
+    \node[lifeline] (kwriter) at (3.2,0) {底层写入};
+    \node[lifeline] (comm) at (6.4,0) {提交协调};
+    \node[lifeline] (kcomm) at (9.6,0) {Kafka 提交};
 
-    \draw[dashed] (writer.south) -- ++(0,-5.3);
-    \draw[dashed] (kwriter.south) -- ++(0,-5.3);
-    \draw[dashed] (comm.south) -- ++(0,-5.3);
-    \draw[dashed] (kcomm.south) -- ++(0,-5.3);
+    \draw[dashed] (writer.south) -- ++(0,-4.7);
+    \draw[dashed] (kwriter.south) -- ++(0,-4.7);
+    \draw[dashed] (comm.south) -- ++(0,-4.7);
+    \draw[dashed] (kcomm.south) -- ++(0,-4.7);
 
-    \draw[msg] (writer.south) ++(0,-0.7) -- node[lab, above] {按 route 写入} ($(kwriter.south)+(0,-0.7)$);
-    \draw[msg] (writer.south) ++(0,-1.7) -- node[lab, above] {\id{prepareCommit()}} ($(kwriter.south)+(0,-1.7)$);
-    \draw[returnmsg] (kwriter.south) ++(0,-2.4) -- node[lab, above] {Kafka committable} ($(writer.south)+(0,-2.4)$);
-    \draw[msg] (writer.south) ++(0,-3.1) -- node[lab, above] {包装为\\动态 committable} ($(comm.south)+(0,-3.1)$);
-    \draw[msg] (comm.south) ++(0,-4.0) -- node[lab, above] {按 route 分组} ($(kcomm.south)+(0,-4.0)$);
+    \draw[msg] (writer.south) ++(0,-0.7) -- node[lab, above] {按路由写入} ($(kwriter.south)+(0,-0.7)$);
+    \draw[msg] (writer.south) ++(0,-1.7) -- node[lab, above] {预提交} ($(kwriter.south)+(0,-1.7)$);
+    \draw[returnmsg] (kwriter.south) ++(0,-2.4) -- node[lab, above] {底层提交对象} ($(writer.south)+(0,-2.4)$);
+    \draw[msg] (writer.south) ++(0,-3.1) -- node[lab, above] {包装为\\动态提交对象} ($(comm.south)+(0,-3.1)$);
+    \draw[msg] (comm.south) ++(0,-4.0) -- node[lab, above] {按路由分组} ($(kcomm.south)+(0,-4.0)$);
     \draw[returnmsg] (kcomm.south) ++(0,-4.8) -- node[lab, above] {提交结果} ($(comm.south)+(0,-4.8)$);
   \end{tikzpicture}
-  \caption{Exactly-once route 级提交流程序列图}
+  \caption{Exactly-once 路由级提交流程序列图}
   \label{fig:exactly-once-sequence}
 \end{figure}
 
@@ -294,7 +352,7 @@ Committer 再按 route 分组提交。
 
 动态发现模块由元数据服务和订阅器组成。元数据服务通过 Kafka 管理面查询当前 Topic 集合，并把每个 Topic 封装为内部 stream 抽象；
 订阅器再根据用户配置的正则模式筛选出候选目标。
-选择 \id{AdminClient} 主动查询，是因为本文关注的是 Kafka Topic 自身变化能否被 Sink 感知，
+选择 Kafka 管理面主动查询，是因为本文关注的是 Kafka Topic 自身变化能否被 Sink 感知，
 而不是依赖外部注册中心维护一份额外目标列表。
 
 该模块的局限也较明确：当前实现以单集群为主，每次刷新都需要重新遍历可见 Topic 列表。
@@ -302,29 +360,29 @@ Committer 再按 route 分组提交。
 
 \subsection{动态路由模块}
 
-动态路由模块维护三类信息：逻辑 route 到目标描述的映射、逻辑 route 到已解析物理 route 的缓存、
-以及物理 route 到底层 writer 的映射。三者分离的原因是它们的变化频率和职责不同：
-逻辑 route 表由控制事件更新，解析缓存由 Topic 元数据和正则匹配决定，writer 表则代表实际资源。
+动态路由模块维护三类信息：逻辑路由到目标描述的映射、逻辑路由到已解析物理路由的缓存、
+以及物理路由到写入通道的映射。三者分离的原因是它们的变化频率和职责不同：
+逻辑路由表由控制事件更新，解析缓存由 Topic 元数据和正则匹配决定，写入通道表则代表实际资源。
 
-这种结构避免了两个问题。第一，若每条消息都从逻辑 route 重新扫描全部 Topic，主写入路径成本会过高；
-第二，若逻辑配置和物理 writer 生命周期混在一起，route 更新时容易误关闭仍被其他逻辑 route 引用的 writer。
+这种结构避免了两个问题。第一，若每条消息都从逻辑路由重新扫描全部 Topic，主写入路径成本会过高；
+第二，若逻辑配置和物理写入通道生命周期混在一起，路由更新时容易误关闭仍被其他逻辑路由引用的通道。
 因此，本文采用解析缓存和引用检查来平衡写入效率与资源回收。
 
 \subsection{自动订阅模块}
 
-自动订阅模块负责维护 \id{activeRouteIds}。当元数据刷新触发后，系统重新计算当前活动 route 集合；
-当新 route 出现时，writer 在首次需要写入时被创建；当 route 退役且不再被显式逻辑 route 引用时，
-非事务路径会尝试关闭并移除对应 writer。
+自动订阅模块负责维护当前活动路由集合。当元数据刷新触发后，系统重新计算当前活动路由集合；
+当新路由出现时，写入通道在首次需要写入时被创建；当路由退役且不再被显式逻辑路由引用时，
+非事务路径会尝试关闭并移除对应写入通道。
 
 该模块直接服务于第三章的发现实时性和资源可控性要求。
-刷新间隔决定新增 Topic 的可见上界，惰性创建降低了刷新时的瞬时开销，退役清理则避免 writer 无限制累积。
+刷新间隔决定新增 Topic 的可见上界，惰性创建降低了刷新时的瞬时开销，退役清理则避免写入通道无限制累积。
 
 \subsection{状态与提交模块}
 
-状态与提交模块把动态行为纳入 Flink 原生容错体系。状态侧以 route 为单位保存恢复所需的最小信息；
-提交侧以 route 为单位包装和分发 committable。
-这样做的核心原因是动态 Sink 的写入目标不是一个固定 Topic，而是一组随时间变化的 route。
-只有让状态和提交对象都携带 route 元数据，恢复和提交阶段才能区分不同物理目标。
+状态与提交模块把动态行为纳入 Flink 原生容错体系。状态侧以路由为单位保存恢复所需的最小信息；
+提交侧以路由为单位包装和分发提交对象。
+这样做的核心原因是动态 Sink 的写入目标不是一个固定 Topic，而是一组随时间变化的路由。
+只有让状态和提交对象都携带路由元数据，恢复和提交阶段才能区分不同物理目标。
 
 \section{关键流程小结}
 
@@ -332,25 +390,25 @@ Committer 再按 route 分组提交。
 
 \begin{enumerate}
   \item 作业启动时，构建层注入正则模式、元数据服务、序列化器和投递语义。
-  \item Writer 初始化后执行一次强制刷新，形成初始活动 route 集合。
-  \item 普通数据和 route 更新事件共流进入 Writer；更新事件先改写逻辑 route 表，普通数据再根据 route 信息进入显式路由或自动发现路径。
-  \item 写入前，系统为缺失的物理 route 懒创建底层 KafkaSink writer，并复用其序列化、发送和事务能力。
-  \item Checkpoint 触发时，系统以 route 为单位封装 writer 状态；提交阶段以 route 为单位包装和分发 committable。
-  \item 故障恢复时，系统先依据快照恢复历史 route writer，再强制刷新元数据，以兼顾恢复一致性和运行期 Topic 变化。
+  \item 写入执行模块初始化后执行一次强制刷新，形成初始活动路由集合。
+  \item 普通数据和路由更新事件共流进入写入执行模块；更新事件先改写逻辑路由表，普通数据再根据路由信息进入显式路由或自动发现路径。
+  \item 写入前，系统为缺失的物理路由懒创建底层 Kafka 写入通道，并复用其序列化、发送和事务能力。
+  \item Checkpoint 触发时，系统以路由为单位封装写入状态；提交阶段以路由为单位包装和分发提交对象。
+  \item 故障恢复时，系统先依据快照恢复历史路由写入通道，再强制刷新元数据，以兼顾恢复一致性和运行期 Topic 变化。
 \end{enumerate}
 
 该流程说明，本章重点不是罗列类和方法，而是展示从第三章需求到连接器算法逻辑的推导：
-动态发现解决目标变化，动态路由解决业务标识与物理 Topic 解耦，writer 生命周期管理解决资源与吞吐折中，
-route 级状态和提交解决 Checkpoint 与事务路径可运行性。
+动态发现解决目标变化，动态路由解决业务标识与物理 Topic 解耦，写入通道生命周期管理解决资源与吞吐折中，
+路由级状态和提交解决 Checkpoint 与事务路径可运行性。
 
 \section{本章小结}
 
 本章从第三章提出的需求和量化指标出发，给出了动态 Kafka Sink 的总体架构、核心流程和状态提交设计。
 为了在秒级发现新增 Topic，系统采用 Kafka 管理面轮询与正则筛选；
-为了让动态路由在小规模场景下接近静态基线吞吐，系统采用 route 解析缓存、writer 懒创建和底层 \id{KafkaSink} 复用；
-为了支持无重启 route 更新，系统利用广播状态传播控制事件，并在 Sink 内部维护逻辑 route 表；
-为了满足 Checkpoint 协同与事务路径可运行性指标，系统把 writer state、committable 和 committer 都组织为 route 级结构。
+为了让动态路由在小规模场景下接近静态基线吞吐，系统采用路由解析缓存、写入通道懒创建和底层 \id{KafkaSink} 复用；
+为了支持无重启路由更新，系统利用广播状态传播控制事件，并在 Sink 内部维护逻辑路由表；
+为了满足 Checkpoint 协同与事务路径可运行性指标，系统把写入状态、提交对象和提交协调都组织为路由级结构。
 
 同时，本章也明确了当前设计取舍：全量元数据刷新降低了差分维护复杂度，但在大规模 Topic 场景下可能带来管理面开销；
-非事务路径已经能够清理退役 writer，而 \id{EXACTLY_ONCE} 路径仍采用保守策略以避免破坏事务边界。
+非事务路径已经能够清理退役写入通道，而精准一次路径仍采用保守策略以避免破坏事务边界。
 这些取舍将直接对应第 5 章的发现实时性、吞吐可接受性、小规模扩展性、Checkpoint 协同和事务路径可运行性实验结果。

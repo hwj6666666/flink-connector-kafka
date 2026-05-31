@@ -24,7 +24,33 @@ bootstrap servers、序列化器与投递语义，后续运行期间若底层目
 
 \begin{figure}[htbp]
   \centering
-  \safeincludegraphics[width=0.92\textwidth]{offline_vs_regex_routing.png}
+  \begin{tikzpicture}[
+    node distance=0.42cm and 1.0cm,
+    box/.style={draw, rounded corners, align=center, minimum width=2.5cm, minimum height=0.62cm, fill=gray!8},
+    arrow/.style={-Latex, thick},
+    title/.style={font=\small\bfseries, align=center}
+  ]
+    \node[title] (oldtitle) {传统停机更新};
+    \node[box, below=of oldtitle] (oldjob) {Flink 作业};
+    \node[box, below=of oldjob] (stop) {停机};
+    \node[box, below=of stop] (modify) {修改配置};
+    \node[box, below=of modify] (fixed) {固定 Topic};
+
+    \node[title, right=3.0cm of oldtitle] (newtitle) {动态发现与路由};
+    \node[box, below=of newtitle] (run) {Flink 作业\\持续运行};
+    \node[box, below=of run] (match) {模式匹配};
+    \node[box, below=of match] (route) {路由映射};
+    \node[box, below=of route] (topic) {新增 Topic\\自动纳入};
+
+    \draw[arrow] (oldjob) -- (stop);
+    \draw[arrow] (stop) -- (modify);
+    \draw[arrow] (modify) -- (fixed);
+    \draw[arrow] (run) -- (match);
+    \draw[arrow] (match) -- (route);
+    \draw[arrow] (route) -- (topic);
+    \draw[arrow] (fixed.east) -- (topic.west);
+    \node[align=center, font=\small, below=0.15cm of topic, xshift=-2.2cm] {写入目标变化不再直接触发作业重启};
+  \end{tikzpicture}
   \caption{传统离线更新方式与基于正则的动态路由方式对比}
   \label{fig:intro-offline-vs-regex}
 \end{figure}
@@ -37,7 +63,7 @@ bootstrap servers、序列化器与投递语义，后续运行期间若底层目
 值得注意的是，动态能力并非完全没有先例。社区已经在 Source 侧推进了 FLIP-246\cite{flip246}，
 探索按模式动态发现 Kafka Topic 并调整订阅集合；生产端 Sink 方向上，FLIP-515\cite{flip515} 等讨论也表明，
 业界已经意识到“动态写入目标”是值得单独研究的问题。但与消费端相比，Sink 侧除了要解决元数据发现，
-还必须处理 producer 配置、目标 Topic 绑定、writer 生命周期管理、状态快照与提交语义等一系列更复杂的问题。
+还必须处理 producer 配置、目标 Topic 绑定、写入通道生命周期管理、状态快照与提交语义等一系列更复杂的问题。
 正是这一现实差距，构成了本文选题的直接背景。
 
 \section{研究意义}
@@ -51,7 +77,7 @@ bootstrap servers、序列化器与投递语义，后续运行期间若底层目
 这种“下游拓扑可变、上游作业不停”的能力，具有明显的工程收益。
 
 从技术方法角度看，动态 Sink 并不是对静态 Sink 的简单封装，而是涉及元数据发现、逻辑路由与物理 Topic 映射、
-底层 writer 的懒创建与复用、Checkpoint 状态快照、route 级提交与恢复等多个环节的协同设计。
+底层写入通道的懒创建与复用、Checkpoint 状态快照、路由级提交与恢复等多个环节的协同设计。
 因此，研究这一问题不仅能补足 Flink Kafka 集成中的一类能力空白，也能为“如何在统一 Sink API 约束下扩展动态行为”
 提供一条可复用的实现路径。特别是把动态发现与已有容错机制结合起来，对后续其它动态连接器或动态外部系统适配方案，
 也具有一定借鉴意义。
@@ -74,7 +100,7 @@ LogP 性能模型相关工作则从通信模型角度刻画 Kafka 性能特征\c
 然而，上述工作主要把 Kafka 作为独立消息系统进行优化，其核心对象是 broker、分区或客户端负载，
 并不直接解决“Flink 作业运行期间目标 Topic 集合发生变化时，Sink 侧如何自动发现并调整写入路径”的问题。
 Kafka 本身提供了元数据访问、生产者事务和可提交读等底层能力，但这些能力只是动态 Sink 的构建材料；
-如何在流处理连接器中把元数据刷新、生产者生命周期、route 绑定、状态恢复与提交语义组织成完整机制，
+如何在流处理连接器中把元数据刷新、生产者生命周期、路由绑定、状态恢复与提交语义组织成完整机制，
 仍需要在 Flink 连接器层面进一步设计。因此，Kafka 相关研究说明了本文问题的基础设施背景，
 但尚未给出面向 Flink Sink 侧动态写入的直接方案。
 
@@ -91,9 +117,9 @@ Twitter Storm\cite{toshniwal2014storm}、LinkedIn Samza\cite{noghabi2017samza} �
 但它们的主要关注点通常位于计算框架内部，即算子调度、状态迁移、资源管理和运行时容错；
 对于外部系统连接器，尤其是 Sink 侧写入目标在运行期变化时的适配机制，讨论相对有限。
 Flink 官方 Kafka Connector 和统一 Sink API 为外部写入提供了标准接口\cite{flinkKafkaDocs,flinkUnifiedSink}，
-并支持 \id{AT_LEAST_ONCE} 与 \id{EXACTLY_ONCE} 等投递语义，但常规 Kafka Sink 仍要求在构建阶段绑定目标 Topic。
+并支持至少一次与精准一次等投递语义，但常规 Kafka Sink 仍要求在构建阶段绑定目标 Topic。
 这意味着 Flink 运行时已经具备支撑动态行为的状态与提交框架，
-但官方静态 Sink 使用方式尚未充分覆盖动态 Topic 发现、route 级 writer 管理和运行期目标切换。
+但官方静态 Sink 使用方式尚未充分覆盖动态 Topic 发现、路由级写入通道管理和运行期目标切换。
 
 \subsection{开源数据接入项目与动态订阅实践}
 
@@ -107,7 +133,7 @@ Flink CDC 项目进一步把数据库变更捕获能力接入 Flink 生态，用
 Kafka Connect 和 Debezium 更强调“外部系统到 Kafka”或“Kafka 到外部系统”的通用集成，
 其动态性多体现在任务配置、表捕获范围或 connector 实例管理上；Flink CDC 重点解决数据库表结构和变更日志进入 Flink 的问题。
 它们并不直接面向“一个正在运行的 Flink Kafka Sink 根据 Kafka Topic 元数据变化自动扩展写入目标”
-这一场景，也不需要在同一个 Flink Sink writer 内部处理多物理 Topic 的懒创建、状态封装和 route 级提交。
+这一场景，也不需要在同一个 Flink Sink 写入执行模块内部处理多物理 Topic 的懒创建、状态封装和路由级提交。
 因此，开源项目提供了数据接入工程化的重要参照，却不能替代本文所需的 Sink 侧动态写入机制。
 
 \subsection{动态 Topic 订阅与动态 Sink 相关工作}
@@ -116,13 +142,13 @@ Kafka Connect 和 Debezium 更强调“外部系统到 Kafka”或“Kafka 到�
 目标是在 Source 侧支持基于模式的 Kafka Topic 动态发现，并在运行期调整订阅集合\cite{flip246}。
 这一工作与本文最接近之处在于都依赖 Kafka 元数据发现和正则匹配；
 但 Source 侧的核心问题是分区发现、分区分配和消费进度管理，而 Sink 侧面对的是 producer 创建、
-目标 Topic 绑定、写入 fan-out、底层 writer 生命周期、事务提交与恢复状态组织，两者的状态语义和失败边界并不相同。
+目标 Topic 绑定、写入 fan-out、底层写入通道生命周期、事务提交与恢复状态组织，两者的状态语义和失败边界并不相同。
 
 生产端方向上，FLIP-515 已经开始讨论 Dynamic Kafka Sink 的必要性与接口形态\cite{flip515}。
 这说明社区已经意识到动态写入目标并非简单配置项，而是需要在 Sink 层单独建模的问题。
 不过，从公开资料看，相关讨论更多停留在设计提案与能力方向层面，
-对“如何在一个可运行原型中组织正则 Topic 发现、逻辑 route 到物理 Topic 的映射、多 writer 复用、
-Checkpoint 状态快照以及 \id{EXACTLY_ONCE} 事务路径”的完整实现与实验验证仍较有限。
+对“如何在一个可运行原型中组织正则 Topic 发现、逻辑路由到物理 Topic 的映射、多写入通道复用、
+Checkpoint 状态快照以及 exactly-once 事务路径”的完整实现与实验验证仍较有限。
 工业实践中也有 Kafka 与 Flink 组合进行实时事件处理的案例\cite{saket2024kafkaflink}，
 但其关注重点通常是流式计算逻辑和事件关联，而不是 Sink 端目标集合的运行期动态变化。
 
@@ -139,8 +165,8 @@ FLIP-246 与 FLIP-515 则直接表明动态 Topic 发现和动态 Sink 是社区
 
 因此，本文需要解决的核心问题可以归纳为：如何在不修改 Flink 运行时的前提下，
 基于统一 Sink API 设计并实现一套 Kafka Sink 侧动态 Topic 发现与订阅机制，
-使作业能够在运行期感知目标变化、维护逻辑 route 与物理 Topic 的映射、
-按 route 管理底层 writer 与状态，并尽可能复用既有 KafkaSink 的写入与提交能力。
+使作业能够在运行期感知目标变化、维护逻辑路由与物理 Topic 的映射、
+按路由管理底层写入通道与状态，并尽可能复用既有 KafkaSink 的写入与提交能力。
 这一问题正是后续需求分析、系统设计和实验验证的出发点，
 也避免了先假设“必须实现动态 Sink”再寻找理由的逻辑倒置。
 
@@ -151,10 +177,8 @@ FLIP-246 与 FLIP-515 则直接表明动态 Topic 发现和动态 Sink 是社区
   \item 分析现有基于统一 Sink API 的 Kafka Sink 在 Topic 与生产者管理上的静态性局限\cite{flinkUnifiedSink,flinkKafkaDocs}；
   \item 设计基于正则表达式的 Topic 模式、周期性元数据扫描与差异计算，形成发现—更新闭环；
   \item 提出逻辑路由与物理路由分离的映射模型，结合广播状态支持运行期路由更新；
-  \item 基于现有代码实现 \id{DynamicKafkaSink}、\id{DynamicKafkaSinkWriter}、\id{SingleClusterTopicMetadataService}、
-        \id{DynamicKafkaSinkWriterState}、\id{DynamicKafkaCommittable} 与 \id{DynamicKafkaCommitter} 等
-        连接器核心组件，完成动态 route 管理、状态恢复与提交链路；
-  \item 以 \id{app} 模块作为实验载体，对 connector 暴露出的动态发现、显式 route 更新与静态基线能力进行验证，
+  \item 基于现有代码实现元数据发现、运行时路由、写入器管理、状态恢复与提交协调等连接器核心能力，完成动态路由管理、状态恢复与提交链路；
+  \item 以实验作业作为载体，对 connector 暴露出的动态发现、显式路由更新与静态基线能力进行验证，
         并据此分析当前实现的能力边界与后续优化方向。
 \end{enumerate}
 
