@@ -1,0 +1,59 @@
+% !TEX root = ../main.tex
+
+\chapter{总结与展望}
+
+\section{研究工作总结}
+
+本文围绕“基于 Flink 的动态 Kafka Topic 发现与订阅机制”这一主题，完成了从问题提出、
+相关工作分析，到系统设计、实现与验证的完整过程。与仅停留在概念层面的方案不同，
+本文工作已经落到可运行的连接器代码：在 \texttt{connector} 模块中实现了 \texttt{DynamicKafkaSink}、
+\texttt{DynamicKafkaSinkBuilder}、\texttt{DynamicKafkaSinkWriter}、\texttt{SingleClusterTopicMetadataService}、
+\texttt{DynamicKafkaSinkWriterState}、\texttt{DynamicKafkaCommittable} 与 \texttt{DynamicKafkaCommitter} 等核心类；
+\texttt{app} 模块主要作为实验与验证载体，用于驱动 connector 暴露出的动态发现、显式 route 更新与静态基线能力。
+
+从实现路径看，本文并未完全推翻现有 KafkaSink，而是采取“动态外壳 + 静态内核”的思路：
+外层由 \texttt{DynamicKafkaSinkWriter} 负责 route 解析、元数据刷新与多 writer 协调，
+内层每个物理 route 仍复用标准 \texttt{KafkaSink} 的 writer、状态与提交逻辑。
+这种设计既满足了本文关于“逻辑路由与物理路由分离”的设计目标，也与开题阶段对“基于正则表达式实现动态发现、
+并与 Flink Checkpoint 机制结合”的问题界定基本一致。当前实现已经能够在不重启作业的情况下接收 route 更新事件、
+自动解析匹配 Topic 并完成多目标写入，形成了一套完整可运行的动态 Sink 方案。
+
+进一步而言，本文的价值并不只在于“实现了一个能运行的 demo”，更在于把问题拆分为可操作的几个关键环节：
+一是以元数据服务和正则匹配为基础完成动态目标发现；二是以逻辑 route 与物理 Topic 解耦完成运行期路由更新；
+三是以 route 为单位组织 writer、状态和提交路径，使动态行为尽可能兼容现有 KafkaSink 的实现框架。
+这种拆分方式使课题既具备工程可落地性，也具备较清晰的方法论结构。
+
+\section{存在的不足}
+
+尽管当前 connector 已具备原型可运行性，但距离更成熟的工程化方案仍有若干差距。首先，
+当前元数据发现依赖 \texttt{AdminClient.listTopics()} 的周期性轮询，在 Topic 规模扩大后会带来额外管理面开销，
+并且 discovery interval 决定了发现时延下界。其次，当前实现能够新增 route writer，
+但尚未在 route 失活时及时回收 \texttt{clusterWritersByRouteId} 中的旧 writer，因而在长时间运行或频繁变更场景下，
+资源占用可能持续累积。再次，当前验证载体主要使用的是 \texttt{AT\_LEAST\_ONCE}，虽然动态 Sink 设计上支持
+\texttt{EXACTLY\_ONCE}，但尚未结合复杂故障场景完成系统化验证。
+
+此外，当前自动发现路径默认会把普通记录广播写入所有 \texttt{activeRouteIds}，这在某些“多目标复制”场景中是合理的，
+但在更一般的业务分流场景下可能造成不必要的写放大。日志、监控指标、异常治理与配置版本控制等工程特性，
+也仍需进一步加强。这些不足与中期报告中“元数据访问开销、实时性、一致性、工程化能力仍需完善”的结论相互呼应。
+
+在本文最新实现中，逻辑 route 的删除语义已经补充完成，非事务路径下的退役 writer 清理也已落地，
+这使 route 生命周期管理相比中期阶段更加完整；但 \texttt{EXACTLY\_ONCE} 路径上的安全回收、事务边界验证与
+更精细的资源治理仍未完全解决。需要强调的是，这些不足并不否定原型本身的研究意义，而是说明当前实现更适合作为“动态 Sink 机制的验证性实现”。
+也就是说，本文已经证明了动态发现、动态路由与 route 级状态封装在 Flink Kafka Sink 场景下具有可行性，
+但距离一个大规模、长期稳定运行的生产级方案，还需要在资源治理、边界条件和异常恢复方面继续完善。
+
+\section{未来工作展望}
+
+未来的改进可从四个方向推进。第一，优化元数据访问机制，在保持动态发现能力的同时降低轮询成本，
+例如引入缓存、差分刷新或更细粒度的发现策略，以缩短 Topic 变化到可写之间的时延。第二，
+完善 writer 生命周期管理，在 route 失活后安全回收对应 writer，并研究更合理的 route 级资源上限控制策略。
+第三，围绕 \texttt{EXACTLY\_ONCE} 路径设计更系统的故障恢复实验，验证 route 级状态恢复、事务前缀管理、
+提交重试与幂等性边界。第四，进一步强化工程化能力，包括指标埋点、日志可观测性、异常分类处理、
+配置热更新版本管理以及更丰富但不改变 connector 核心语义的验证载体。
+
+在论文工作层面，后续还需要结合完整实验数据补充第 5 章中的定量分析，例如 discovery interval 对发现延迟的影响、
+route 数量增长对吞吐与资源占用的影响，以及动态方案与静态 \texttt{KafkaSink} 的对比结果。通过这些补充，
+可使本文从“原型验证与可行性说明”进一步提升为“具有更强实证支撑的毕业设计成果”。
+
+总体而言，本文已经完成了毕业设计从“选题论证”到“原型落地”的关键阶段。后续只要继续围绕实验数据补充、
+实现细节打磨和论文语言精修推进，就可以使整篇论文在工程深度、论证完整性和学术表达上进一步趋于成熟。

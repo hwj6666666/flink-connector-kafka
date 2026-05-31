@@ -1,0 +1,483 @@
+% !TEX root = ../main.tex
+
+\chapter{基于 Flink 的动态 Topic 订阅系统设计与实现}
+
+\section{系统总体架构设计}
+
+结合本文提出的“逻辑路由与物理路由分离”思想，以及当前代码结构，本文把系统设计的重点放在
+\texttt{connector} 模块上。若从连接器内部职责划分出发，本系统可分为动态 Sink 构建层、运行时写入层、
+元数据发现层以及状态与提交层四个核心层次；应用侧作业只作为验证载体，用于向 connector 提供测试数据与控制事件。
+其中，动态 Sink 构建层由 \texttt{DynamicKafkaSink.builder()} 与 \texttt{DynamicKafkaSinkBuilder} 组成，
+负责选择订阅模式、绑定元数据服务、设置序列化器与投递语义；运行时写入层由
+\texttt{DynamicKafkaSinkWriter} 主导，承担 route 刷新、route 解析、多 writer 写入、
+快照与提交前准备等核心逻辑；元数据发现层由 \texttt{SingleClusterTopicMetadataService} 通过 \texttt{AdminClient}
+访问 Kafka 集群并返回 \texttt{KafkaStream} / \texttt{ClusterMetadata} 结构；状态与提交层则由
+\texttt{DynamicKafkaSinkWriterState}、\texttt{DynamicKafkaCommittable} 和 \texttt{DynamicKafkaCommitter} 共同组成，
+负责 route 级状态恢复与 route 级提交转发。
+
+从连接器类之间的调用关系看，系统整体链路可以概括为：上层作业把数据流交给 \texttt{DynamicKafkaSink}；
+\texttt{DynamicKafkaSink} 在 \texttt{createWriter(...)} 或 \texttt{restoreWriter(...)}
+中创建 \texttt{DynamicKafkaSinkWriter}；Writer 通过 \texttt{KafkaStreamSubscriber} 与 \texttt{KafkaMetadataService}
+解析当前有效 route，并按 route 懒加载底层 \texttt{KafkaSink} writer；Checkpoint 到来时，Writer 把每个 route 对应的
+底层 \texttt{KafkaWriterState} 包装为 \texttt{DynamicKafkaSinkWriterState}；提交时，则把底层 \texttt{KafkaCommittable}
+封装为 \texttt{DynamicKafkaCommittable}，再由 \texttt{DynamicKafkaCommitter} 按 route fan-out 给真实的 \texttt{KafkaCommitter}。
+
+如果从“上层如何调用 connector”这一角度观察，应用层只需完成三件事：准备数据流、准备控制事件流、
+并在构建阶段把 \texttt{streamPattern}、元数据服务和 serializer 注入 \texttt{DynamicKafkaSink}。
+因此，论文的重点不在于作业装配本身，而在于这些参数进入 connector 后如何驱动后续的 route 解析、
+writer 管理和状态提交。具体配置样例与运行命令已整理到附录~\ref{appendix:configs} 与
+附录~\ref{appendix:commands}。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\textwidth]{dynamic_sink_architecture.png}
+  \caption{动态 Topic 发现、正则匹配与路由写入的总体架构示意}
+  \label{fig:dynamic-sink-architecture}
+\end{figure}
+
+图~\ref{fig:dynamic-sink-architecture} 对应本文方案在概念层面的总体结构：Kafka 集群元数据先进入动态发现模块，
+随后由正则匹配模块筛选目标，再与映射路由模块共同决定写入路径，最终由 Flink 侧的动态 Sink 完成多目标输出。
+该图与本节的分层描述相对应，有助于从整体上理解后续模块间的调用关系。
+
+\section{系统模块划分}
+
+\subsection{Topic 动态发现模块}
+
+动态发现模块对应 \texttt{SingleClusterTopicMetadataService} 与 \texttt{StreamPatternSubscriber} 的组合。
+\texttt{SingleClusterTopicMetadataService} 在 \texttt{getAllStreams()} 中调用 \texttt{AdminClient.listTopics().names().get()}，
+把每个 Topic 封装为一个 \texttt{KafkaStream}，并进一步放入以 \texttt{clusterId} 为键的 \texttt{ClusterMetadata} 中；
+在该实现里，一个 stream 实际上就等价于一个 Topic，因此 stream 发现就是 Topic 发现。
+\texttt{StreamPatternSubscriber} 则在 \texttt{getSubscribedStreams(...)} 中遍历所有 stream，
+对 \texttt{streamId} 应用正则匹配，并返回命中的集合。
+
+这一设计的优点是实现路径短、易于与现有 Kafka Admin API 对接，且能直接复用 \texttt{KafkaStreamSubscriber}
+抽象；其局限在于当前实现默认单集群，且每次刷新都需要重新遍历可见 Topic 列表，
+尚未引入增量缓存或事件通知机制。
+
+\subsection{正则匹配模块}
+
+正则匹配在当前实现中出现于两个位置。其一是构建阶段的 stream pattern：
+\texttt{DynamicKafkaSinkBuilder.setStreamPattern(Pattern streamPattern)} 创建 \texttt{StreamPatternSubscriber}，
+用于自动发现路径。其二是显式 route 路径中的 \texttt{KafkaRouteDestination.topicPattern}：
+\texttt{DynamicKafkaSinkWriter.resolveExplicitRoutes(...)} 会再次编译该正则，并同时对 \texttt{stream.getStreamId()}
+和候选 \texttt{topic} 执行匹配。由于在 \texttt{SingleClusterTopicMetadataService} 中 streamId 就是 topic 名称，
+这种“双重匹配”在当前单集群实现里略显重复，但它为未来扩展“逻辑 stream 与物理 topic 不完全等价”的实现留下了接口空间。
+
+\subsection{动态订阅模块}
+
+动态订阅模块的核心入口是 \texttt{DynamicKafkaSinkWriter.refreshRouteIfNeeded(...)}。
+该方法维护两个关键变量：\texttt{activeRouteIds} 表示当前生效的自动发现 route 集合，
+\texttt{nextMetadataRefreshTimestamp} 表示下一次允许执行元数据刷新的时间戳。
+当刷新条件满足时，Writer 调用 \texttt{resolveRoutes()} 重新计算 route 列表，
+再通过 \texttt{clusterWritersByRouteId.computeIfAbsent(...)} 为尚不存在的 route 创建新的 \texttt{ClusterWriter}。
+
+在本文当前版本的实现中，route 生命周期管理已经比前一阶段更进一步：对于
+\texttt{DeliveryGuarantee.NONE} 与 \texttt{AT\_LEAST\_ONCE} 路径，Writer 会在刷新、刷写、
+提交准备与状态快照之后调用 \texttt{cleanupRetiredWriters()}，关闭那些既不属于当前
+\texttt{activeRouteIds}，也不再被显式逻辑 route 引用的历史 writer，从而避免其长期留在内存与提交链路中。
+不过，对于 \texttt{EXACTLY\_ONCE} 路径，当前实现仍采取保守策略，暂不自动清理退役 writer，
+以避免过早关闭事务上下文带来状态不一致问题。因此，本系统已经初步具备了 route 生命周期闭环，
+但仍保留了“事务路径下安全回收”这一后续优化空间。
+
+\subsection{路由映射模块}
+
+路由映射模块由 \texttt{DynamicKafkaRouteEvent}、\texttt{DynamicSinkEvent}、\texttt{KafkaRouteDestination} 以及
+\texttt{DynamicKafkaSinkWriter} 中的 \texttt{explicitRoutesById}、\texttt{explicitResolvedRouteIdsByLogicalId} 两张表共同构成。
+\texttt{DynamicSinkEvent} 既可表示普通数据事件，也可表示路由更新事件；
+\texttt{KafkaRouteDestination} 封装 \texttt{kafkaClusterId}、\texttt{bootstrapServers} 与 \texttt{topicPattern} 三元组，
+是逻辑 route id 对应的物理目标描述。
+
+在验证载体中，\texttt{DynamicJob} 使用 \texttt{MapStateDescriptor<String, KafkaRouteDestination>} 建立广播状态，
+将 YAML 中的 \texttt{route\_map} 读入后封装为一次 \texttt{DynamicSinkEvent.update(...)} 广播事件，
+再由 \texttt{BroadcastProcessFunction} 写入广播状态并原样输出到下游 Sink。
+这样，Sink 侧既能收到业务数据，也能收到 route 更新控制消息，形成“控制面与数据面共流”的运行模型。
+
+需要指出的是，当前版本还补充了逻辑 route 的删除语义：在 route 更新事件中，若某个
+\texttt{routeId} 对应的 \texttt{KafkaRouteDestination} 为 \texttt{null}，则表示该逻辑 route 被显式移除。
+应用层广播状态会执行 \texttt{remove(routeId)}，Sink 侧则同步从 \texttt{explicitRoutesById} 与
+\texttt{explicitResolvedRouteIdsByLogicalId} 中删除对应项。这意味着 route 现已不再只有“新增和覆盖”，
+而是具备了基本的“新增、更新、删除”三种管理语义。
+
+\subsection{动态 Sink 模块}
+
+\texttt{DynamicKafkaSink} 是整个动态写入机制的统一入口。它实现了
+\texttt{TwoPhaseCommittingStatefulSink<IN, DynamicKafkaSinkWriterState, DynamicKafkaCommittable>}，
+说明它同时支持 writer 状态恢复与提交器路径。类内部保存 \texttt{KafkaStreamSubscriber}、
+\texttt{KafkaMetadataService}、\texttt{KafkaRecordSerializationSchema}、\texttt{DeliveryGuarantee}、
+\texttt{transactionalIdPrefix} 与 \texttt{metadataRefreshIntervalMs} 等关键配置，
+并在 \texttt{createWriter(...)} 与 \texttt{restoreWriter(...)} 中把这些配置传给 \texttt{DynamicKafkaSinkWriter}。
+
+与静态 \texttt{KafkaSink} 不同，动态 Sink 本身不直接向某一个固定 Topic 发送数据，
+而是把“写到哪”推迟到 Writer 运行时决定。因此，\texttt{DynamicKafkaSink} 的主要职责不是发送消息，
+而是为 Writer 提供正确的订阅器、元数据服务、公共 Producer 属性与提交语义。
+
+\section{动态 Topic 发现机制设计}
+
+\subsection{Kafka 元数据获取方式}
+
+当前实现中的元数据获取采用主动查询方式。\texttt{SingleClusterTopicMetadataService.getAdminClient()}
+会延迟初始化一个 Kafka \texttt{AdminClient}，并为其补充 \texttt{client.id}，然后在 \texttt{getAllStreams()} 中调用
+\texttt{listTopics()} 返回当前所有 Topic 名称；每个 Topic 会被封装为一个 \texttt{KafkaStream(topic, clusterMetadataMap)}。
+这种设计的优点是实现简单、与 Kafka 官方管理接口一致；缺点是刷新频率高时会增加 AdminClient 调用压力。
+
+代码清单~\ref{code:get-all-streams} 给出了该过程的关键实现。可以看到，
+\texttt{SingleClusterTopicMetadataService} 实际上把“Topic 列表”直接提升为了
+\texttt{Set<KafkaStream>}，因此后续订阅器与 Writer 可以统一围绕 \texttt{KafkaStream} 抽象工作，而不必直接依赖
+\texttt{AdminClient} 的返回结构。
+
+\begin{codeblock}[language=Java,caption={单集群元数据服务通过 AdminClient 拉取全部 Topic},label={code:get-all-streams}]
+@Override
+public Set<KafkaStream> getAllStreams() {
+    try {
+        return getAdminClient().listTopics().names().get().stream()
+                .map(this::createKafkaStream)
+                .collect(Collectors.toSet());
+    } catch (InterruptedException | ExecutionException e) {
+        throw new RuntimeException("Fetching all streams failed", e);
+    }
+}
+\end{codeblock}
+
+由于 \texttt{ClusterMetadata} 中同时保存 \texttt{topics} 与 \texttt{properties}，动态 Sink 在后续创建 route writer 时，
+不仅能拿到目标 Topic，也能继承该 cluster 对应的连接参数。这为未来多集群扩展提供了基础。
+
+\subsection{Topic 变化检测策略}
+
+与许多显式维护“上一轮 Topic 集合差分”的实现不同，当前 Writer 采用更直接的刷新策略：
+每次 \texttt{refreshRouteIfNeeded(...)} 触发时重新调用 \texttt{resolveRoutes()}，把当前元数据投影为新的 route 集合，
+再用 \texttt{activeRouteIds = routes.stream().map(...).collect(...)} 覆盖活动集合。
+也就是说，当前代码层面并未单独维护“新增 / 删除 / 保持不变”的差分表，
+而是通过“重算活动 route 集合 + 按需创建新 writer”的方式实现动态扩写。
+
+这种实现降低了状态管理复杂度，但也带来两个后果：一是 route 删除后旧 writer 仍可能保留在
+\texttt{clusterWritersByRouteId} 中；二是当 Topic 数量很多时，全量重算的刷新成本会高于增量差分。
+在当前版本中，前一问题已经在非事务路径上得到部分缓解，因为退役 writer 会在合适时机被关闭并移除；
+但对于事务路径和大规模场景，全量重算与保守回收策略仍然意味着较高的工程复杂度。
+
+\subsection{订阅列表更新机制}
+
+自动发现路径的 route 解析由 \texttt{resolveRoutes()} 完成：先调用 \texttt{kafkaStreamSubscriber.getSubscribedStreams(...)}
+得到订阅 stream 集合，再遍历每个 stream 的 \texttt{clusterMetadataMap}，筛选 \texttt{isClusterActive(...)} 为真的 cluster，
+最终为每个 \texttt{(clusterId, topic, bootstrapServers)} 组合构造一个 \texttt{ResolvedRoute}。
+\texttt{ResolvedRoute} 内部包含 \texttt{routeId}、\texttt{kafkaClusterId}、\texttt{topic}、\texttt{transactionalIdPrefix} 与
+\texttt{kafkaProducerConfig}，它是底层 writer 创建的直接输入。
+
+route id 的构造方式也值得说明：自动发现路径使用
+\texttt{clusterId|topic|bootstrapServers}，显式 route 路径使用
+\texttt{logicalRouteId|clusterId|topic|bootstrapServers}。这种 route id 设计既保证了物理写入目标的唯一性，
+也方便在提交与恢复阶段按 route 维度分组。
+
+\section{基于正则表达式的匹配机制}
+
+\subsection{Pattern 设计原则}
+
+从代码实现看，Pattern 的使用遵循两个原则。第一，构建期即完成编译，避免在主处理路径重复创建 Pattern 对象；
+第二，Pattern 应尽量与 Topic 命名规范一致，避免过宽正则带来大范围误命中。
+例如，配置中的 \texttt{\^{}dynamic-kafka-sink-a\$} 与 \texttt{\^{}dynamic-kafka-sink-b\$} 就显式限定了完整 Topic 名称，
+比简单的模糊包含匹配更安全。
+
+此外，显式 route 的 \texttt{topicPattern} 不仅决定了将来能命中的 Topic，也隐含决定了 route 的 fan-out 范围。
+若一个正则可能匹配多个 Topic，则一个逻辑 route id 可能解析成多个物理 route。
+这种行为是当前设计允许的，但也会带来更高的 writer 数量与更复杂的提交路径。
+
+\subsection{匹配流程与实现}
+
+自动发现路径中，\texttt{StreamPatternSubscriber} 对 \texttt{streamId} 逐一执行 \texttt{matcher(...).find()}；
+显式路由路径中，\texttt{resolveExplicitRoutes(...)} 首先根据 \texttt{KafkaRouteDestination.topicPattern} 编译正则，
+然后遍历 \texttt{kafkaMetadataService.getAllStreams()} 返回的所有 stream。若 stream 命中模式，
+再继续遍历其 \texttt{clusterMetadataMap} 与具体 topic 集合，对 topic 再做一次正则匹配。
+匹配成功后，Writer 用逻辑 route id、clusterId、topic 与 bootstrapServers 组装新的物理 route id，
+并调用重载的 \texttt{createResolvedRoute(...)} 生成 route 描述。
+
+这一流程说明：当前系统的逻辑 route 不是直接绑定“某一个固定 topic”，而是绑定“一个可解析的物理目标集合”。
+这正是本文“逻辑路由与物理路由分离”设计思想在代码层面的实现落点。
+
+\section{动态订阅机制实现}
+
+\subsection{动态写入目标更新策略}
+
+\texttt{DynamicKafkaSinkWriter.write(...)} 是运行时主入口。该方法首先判断输入元素是否实现了
+\texttt{DynamicKafkaRouteEvent}。若是 route 更新事件，则直接调用 \texttt{applyRouteUpdates(...)} 更新逻辑路由表；
+若元素显式携带 \texttt{routeId}，则进入 \texttt{writeToExplicitRoute(...)}；否则进入自动发现路径，
+先调用 \texttt{refreshRouteIfNeeded(false)}，再把当前记录写到所有 \texttt{activeRouteIds} 对应的 writer 中。
+
+这一路径在代码层面非常清晰，如代码清单~\ref{code:writer-main-path} 所示。该实现有两个值得注意的特点：
+其一，控制事件和业务数据共用同一输入流，但在 Writer 内部被快速分流；其二，自动发现路径默认把普通记录
+复制到全部活动 route，而不是只选取其中一个目标。
+
+\begin{codeblock}[language=Java,caption={DynamicKafkaSinkWriter 的主写入路径},label={code:writer-main-path}]
+@Override
+public void write(IN element, Context context) throws IOException, InterruptedException {
+    if (element instanceof DynamicKafkaRouteEvent) {
+        DynamicKafkaRouteEvent routeEvent = (DynamicKafkaRouteEvent) element;
+        if (routeEvent.isRouteUpdate()) {
+            applyRouteUpdates(routeEvent.getRouteUpdates());
+            return;
+        }
+        String routeId = routeEvent.getRouteId();
+        if (routeId != null) {
+            writeToExplicitRoute(routeId, element, context);
+            return;
+        }
+    }
+    refreshRouteIfNeeded(false);
+    Preconditions.checkState(!activeRouteIds.isEmpty(),
+            "No active routes resolved for DynamicKafkaSink.");
+    for (String routeId : activeRouteIds) {
+        ClusterWriter<IN> clusterWriter = clusterWritersByRouteId.get(routeId);
+        Preconditions.checkNotNull(clusterWriter).writer.write(element, context);
+    }
+}
+\end{codeblock}
+
+\texttt{writeToExplicitRoute(...)} 的实现很能体现系统特点：若逻辑 route id 首次出现，
+Writer 会先在 \texttt{explicitResolvedRouteIdsByLogicalId} 中检查是否已解析过物理 route；若没有，则调用
+\texttt{resolveExplicitRoutes(...)} 根据 \texttt{KafkaRouteDestination} 解析出物理 route 列表，并为每个物理 route
+创建底层 writer。随后，同一逻辑 route id 的后续消息即可直接复用这些物理 writer。
+
+这说明当前系统不是简单地“每条消息临时查一次 Topic 并发送”，而是把 route 解析结果缓存下来，
+以减少重复创建 writer 的开销。
+
+\subsection{无重启更新机制设计}
+
+无重启更新体现在应用层与 Sink 层的协同。应用层 \texttt{DynamicJob} 使用 \texttt{BroadcastStream} 把 route 更新事件
+发送到所有并行实例；\texttt{RouteBroadcastProcessFunction.processBroadcastElement(...)} 将其写入广播状态，
+同时继续向下游输出该事件。Sink 接收到该事件后，\texttt{DynamicKafkaSinkWriter} 在 \texttt{applyRouteUpdates(...)} 中
+直接更新本地 \texttt{explicitRoutesById}，并清除旧的 \texttt{explicitResolvedRouteIdsByLogicalId} 缓存，
+使下一条数据到来时触发重新解析。
+
+这种做法的优点是实现简单，route 更新不需要停止作业；缺点是 route 更新事件与普通数据事件共流，
+因此要依赖输入顺序保证“先更新、后使用”的基本时序。当前 \texttt{BroadcastProcessFunction} 已在进入 Sink 前做了一层 route 过滤，
+但在更复杂场景下，仍可进一步研究显式版本号、双缓冲配置或 barrier 对齐等方案。
+相比前一阶段，本版本已经把“route 删除”纳入无重启更新语义中，使逻辑配置的热更新更加完整。
+
+\section{动态路由机制设计（重点）}
+
+\subsection{Topic 与业务逻辑映射模型}
+
+本项目把业务侧输入抽象为 \texttt{DynamicSinkEvent(routeId, message)}，把物理写入目标抽象为
+\texttt{KafkaRouteDestination(kafkaClusterId, bootstrapServers, topicPattern)}。因此，逻辑路由模型可以表述为：
+业务事件先给出 route id，再由 route id 查得物理目标描述，最后由物理目标描述解析出实际的 Topic 集合。
+这一模型避免了业务逻辑直接感知 Kafka Topic 细节，有利于在 route 配置调整时保持上游代码稳定。
+
+在当前 YAML 配置中，\texttt{route-a} 与 \texttt{route-b} 就是两个典型逻辑 route，
+它们分别映射到 \texttt{\^{}dynamic-kafka-sink-a\$} 和 \texttt{\^{}dynamic-kafka-sink-b\$}。业务事件只需选择 route-a 或 route-b，
+而不必直接写死 Topic 名称。
+
+\subsection{Map 结构设计}
+
+运行时主要维护三张表：\texttt{clusterWritersByRouteId} 保存 route id 到 \texttt{ClusterWriter} 的映射，
+是最核心的物理写入通道表；\texttt{explicitRoutesById} 保存逻辑 route id 到 \texttt{KafkaRouteDestination} 的映射，
+表示最新的逻辑配置；\texttt{explicitResolvedRouteIdsByLogicalId} 保存逻辑 route id 到已解析物理 route id 集合的映射，
+作为 route 解析缓存。
+
+这种三表结构的好处是职责清晰：逻辑配置、物理解析结果和底层 writer 生命周期彼此解耦。
+当 route 更新到来时，仅需更新前两层结构并在必要时懒加载 writer；当快照发生时，则只需遍历实际存在的
+\texttt{ClusterWriter} 并提取其状态。相比把所有信息塞进一张大表，当前结构更利于维护与调试。
+
+\subsection{数据分发策略}
+
+当前实现包含两种数据分发策略。自动发现路径下，普通元素会被广播写入 \texttt{activeRouteIds} 中的所有 route，
+适合“当前所有匹配 Topic 都应接收相同数据”的场景；显式逻辑路由路径下，元素仅写入由 route id 解析得到的
+物理 route 集合，适合“按业务类别分流”的场景。
+
+这一设计既能覆盖本文所讨论的“基于模式自动发现”需求，也能支撑“逻辑路由动态更新”的实现目标。
+但也应看到，自动发现路径的“写向全部活动 route”语义比较强，在某些业务场景中可能导致重复分发；
+后续可进一步引入更细粒度的路由函数来选择单个目标 route。
+
+\section{系统实现细节}
+
+\subsection{核心类设计}
+
+\texttt{DynamicKafkaSink} 是总入口，负责保存构建期配置并在运行时创建 Writer 与 Committer；
+\texttt{DynamicKafkaSinkBuilder} 负责参数合法性检查，例如必须同时提供 subscriber、metadata service 和 serializer，
+在 \texttt{DeliveryGuarantee.EXACTLY\_ONCE} 下还必须提供 \texttt{transactionalIdPrefix}。若用户未显式提供前缀，
+builder 会自动生成 \texttt{DynamicKafkaSink-xxxxxxxx} 形式的默认前缀。
+
+\texttt{DynamicKafkaSinkWriter} 是运行时核心。它内部维护 route 刷新时间、活动 route 集、
+显式路由表、底层 writer 集合等关键状态，并实现 \texttt{write(...)}、\texttt{flush(...)}、\texttt{prepareCommit()}、
+\texttt{snapshotState(...)} 和 \texttt{close()} 等完整生命周期方法。底层每个物理 route 对应一个 \texttt{ClusterWriter}，
+而每个 \texttt{ClusterWriter} 内部实际上又是一个普通 \texttt{KafkaSink} 的 writer 实例。这种“动态外壳 + 静态内核”的设计，
+是当前原型最重要的工程手法之一。
+
+代码清单~\ref{code:refresh-and-create-writer} 进一步展示了运行时“刷新 route 并按需创建 writer”的关键算法。
+可以看到，当前原型并不试图直接改造 Kafka producer 内核，而是对每个解析出的物理 route
+单独构造一个普通 \texttt{KafkaSink} writer，再由外层 \texttt{DynamicKafkaSinkWriter} 负责统一调度。
+这也是本文原型能够在较少改动现有 Connector 基础上快速演化出的重要原因。
+
+\begin{codeblock}[language=Java,caption={运行时 route 刷新与底层 writer 惰性创建逻辑},label={code:refresh-and-create-writer}]
+private void refreshRouteIfNeeded(boolean force) throws IOException {
+    long now = System.currentTimeMillis();
+    if (!force) {
+        if (metadataRefreshIntervalMs <= 0 && !activeRouteIds.isEmpty()) {
+            return;
+        }
+        if (metadataRefreshIntervalMs > 0 && now < nextMetadataRefreshTimestamp) {
+            return;
+        }
+    }
+
+    List<ResolvedRoute> routes = resolveRoutes();
+    activeRouteIds = routes.stream().map(route -> route.routeId).collect(Collectors.toSet());
+    nextMetadataRefreshTimestamp =
+            metadataRefreshIntervalMs > 0 ? now + metadataRefreshIntervalMs : Long.MAX_VALUE;
+
+    for (ResolvedRoute route : routes) {
+        clusterWritersByRouteId.computeIfAbsent(
+                route.routeId,
+                ignored -> createClusterWriter(
+                        route.routeId,
+                        route.kafkaClusterId,
+                        route.topic,
+                        route.transactionalIdPrefix,
+                        route.kafkaProducerConfig,
+                        Collections.emptyList()));
+    }
+    cleanupRetiredWriters();
+}
+\end{codeblock}
+
+\subsection{数据结构设计}
+
+\texttt{DynamicKafkaSinkWriterState} 是 route 级恢复状态对象，包含 route 标识、目标 cluster 与 topic、
+事务前缀、Producer 配置以及底层 \texttt{KafkaWriterState}。其设计目标不是保存所有业务信息，
+而是保存“恢复这个 route 的 writer 所必需的最小集合”。
+
+\texttt{DynamicKafkaCommittable} 则是提交阶段的 route 级包装对象。它把底层 \texttt{KafkaCommittable}
+与 route 元数据绑定起来，使 \texttt{DynamicKafkaCommitter} 能够先按 route 分组，再为每个 route 懒创建对应的
+\texttt{KafkaCommitter}。这样做的好处是不同 route 的提交上下文可以彼此隔离，符合 route 级 writer 的结构。
+
+\subsection{与 Flink Checkpoint 机制的集成}
+
+当前 connector 并不是把动态写入逻辑放在 Flink 容错体系之外单独实现，而是直接接入了统一 Sink API
+提供的状态快照与恢复链路。最直接的证据是 \texttt{DynamicKafkaSink} 实现了
+\texttt{TwoPhaseCommittingStatefulSink<IN, DynamicKafkaSinkWriterState, DynamicKafkaCommittable>}，
+并同时覆写了 \texttt{createWriter(...)}、\texttt{restoreWriter(...)}、
+\texttt{getWriterStateSerializer()} 与 \texttt{createCommitter(...)} 等方法。
+这意味着动态 Sink 在 Flink 看来并不是一个“无状态附加功能”，而是一个能够参与
+Checkpoint、恢复和两阶段提交的正式 Sink 组件。
+
+从运行路径看，Checkpoint 到来时，\texttt{DynamicKafkaSinkWriter.snapshotState(checkpointId)}
+会遍历当前所有物理 route 对应的底层 writer，对每个 writer 调用底层
+\texttt{KafkaWriterState} 的快照方法，并把得到的状态列表连同
+\texttt{routeId}、\texttt{kafkaClusterId}、\texttt{topic}、\texttt{transactionalIdPrefix}
+和 Producer 配置一起封装为 \texttt{DynamicKafkaSinkWriterState}。
+也就是说，当前实现不是只保存一个“全局 route 集合”，而是把状态组织成一组 route 级恢复单元。
+
+\begin{codeblock}[language=Java,caption={动态 Sink 通过 route 级状态接入 Flink Checkpoint},label={code:checkpoint-integration}]
+@Override
+public List<DynamicKafkaSinkWriterState> snapshotState(long checkpointId) throws IOException {
+    refreshRouteIfNeeded(false);
+    List<DynamicKafkaSinkWriterState> states = new ArrayList<>();
+    for (ClusterWriter<IN> clusterWriter : clusterWritersByRouteId.values()) {
+        List<KafkaWriterState> kafkaStates = clusterWriter.writer.snapshotState(checkpointId);
+        if (!kafkaStates.isEmpty()) {
+            states.add(
+                    new DynamicKafkaSinkWriterState(
+                            clusterWriter.routeId,
+                            clusterWriter.kafkaClusterId,
+                            clusterWriter.topic,
+                            clusterWriter.transactionalIdPrefix,
+                            clusterWriter.kafkaProducerConfig,
+                            kafkaStates));
+        }
+    }
+    cleanupRetiredWriters();
+    return states;
+}
+\end{codeblock}
+
+当作业故障恢复时，\texttt{DynamicKafkaSink.restoreWriter(...)} 会把上一次成功快照中保存的
+\texttt{DynamicKafkaSinkWriterState} 集合重新传入 \texttt{DynamicKafkaSinkWriter} 构造函数。
+Writer 启动后，先依据恢复态为每个 route 重建底层 \texttt{KafkaSink} writer，
+随后再执行一次 \texttt{refreshRouteIfNeeded(true)} 与当前元数据重新对齐。这样一来，恢复逻辑既保留了
+Checkpoint 时刻的 route 级写入状态，也允许系统在恢复后继续跟随最新的 Topic 拓扑变化。
+从设计上看，这正是动态 connector 与 Flink Checkpoint 机制真正结合的关键点。
+
+\subsection{Exactly-once 语义设计}
+
+当前 connector 已经沿用了 Flink KafkaSink
+原有的事务型两阶段提交路径来支撑 \texttt{EXACTLY\_ONCE}。首先，在构建阶段，
+\texttt{DynamicKafkaSinkBuilder} 会在 \texttt{DeliveryGuarantee.EXACTLY\_ONCE} 模式下强制要求用户提供
+\texttt{transactionalIdPrefix}；否则 builder 直接拒绝构造。这说明当前实现并没有把 Exactly-once 当成“可选附加优化”，
+而是把它视作需要显式事务前缀才能成立的独立语义模式。
+
+其次，动态 route 语义下的事务前缀并不是所有 route 共用一份，而是通过
+\texttt{buildTransactionalIdPrefix(routeId)} 由全局前缀派生出 route 级事务前缀：
+\texttt{transactionalIdPrefix + "-" + Integer.toUnsignedString(routeId.hashCode())}。
+这样做的目的是让不同物理 route 的事务上下文彼此隔离，避免多个 route 共享同一个事务标识而造成提交冲突。
+在真正创建底层 writer 时，\texttt{DynamicKafkaSinkWriter.createClusterWriter(...)} 会把
+\texttt{deliveryGuarantee}、\texttt{transactionalIdPrefix} 和
+\texttt{transactionNamingStrategy} 一并传给内部构造的普通 \texttt{KafkaSink}，
+从而复用官方 KafkaSink 已有的事务生产与提交能力。
+
+\begin{codeblock}[language=Java,caption={动态 Sink 中 Exactly-once 的 route 级提交路径},label={code:exactly-once-route-commit}]
+@Override
+public void commit(Collection<CommitRequest<DynamicKafkaCommittable>> requests)
+        throws IOException, InterruptedException {
+    if (deliveryGuarantee != DeliveryGuarantee.EXACTLY_ONCE) {
+        return;
+    }
+
+    Map<String, List<CommitRequest<DynamicKafkaCommittable>>> requestsByRouteId =
+            new LinkedHashMap<>();
+    for (CommitRequest<DynamicKafkaCommittable> request : requests) {
+        requestsByRouteId
+                .computeIfAbsent(request.getCommittable().getRouteId(), ignored -> new ArrayList<>())
+                .add(request);
+    }
+
+    for (Map.Entry<String, List<CommitRequest<DynamicKafkaCommittable>>> entry :
+            requestsByRouteId.entrySet()) {
+        KafkaCommitter kafkaCommitter =
+                committersByRouteId.computeIfAbsent(entry.getKey(), ignored -> /* create */);
+        kafkaCommitter.commit(/* route-local KafkaCommittable list */);
+    }
+}
+\end{codeblock}
+
+再次，在提交阶段，\texttt{DynamicKafkaSinkWriter.prepareCommit()} 会把每个 route 下底层
+\texttt{KafkaWriter} 产生的 \texttt{KafkaCommittable} 封装成
+\texttt{DynamicKafkaCommittable}；\texttt{DynamicKafkaCommitter.commit(...)} 再按
+\texttt{routeId} 分组，把提交请求 fan-out 到各自的 \texttt{KafkaCommitter}。
+因此，当前 connector 的 Exactly-once 语义不是一个“全局统一事务”，而是
+“route 级 writer 状态 + route 级 committable + route 级 committer”共同组成的两阶段提交结构。
+
+最后，需要指出当前实现对 Exactly-once 采取了一个保守但合理的工程策略：
+\texttt{cleanupRetiredWriters()} 在 \texttt{DeliveryGuarantee.EXACTLY\_ONCE} 下会直接返回，
+即不自动回收退役 writer。这一做法表明当前实现已经意识到“事务上下文可能跨 Checkpoint 持续存在”，
+过早关闭退役 writer 会给事务边界和恢复一致性带来额外风险。也正因如此，
+本文后续实验虽已对动态发现和显式 route 功能进行了实测，但对 Exactly-once 仍然只停留在设计与代码路径说明，
+尚未覆盖系统性的故障注入与事务恢复验证。
+
+\subsection{关键流程说明}
+
+系统完整流程可概括为：
+第一，\texttt{DynamicJob} 读取 \texttt{config.yaml}，生成 route map 与测试数据源；
+第二，route map 作为广播更新事件进入作业拓扑；
+第三，\texttt{DynamicKafkaSinkBuilder} 构造 \texttt{DynamicKafkaSink}，并把 pattern、metadata service、serializer、
+投递语义等配置注入其中；
+第四，Writer 启动后执行首次 \texttt{refreshRouteIfNeeded(true)}，完成首次 route 解析与 writer 初始化；
+第五，运行过程中普通数据事件与 route 更新事件共流进入 Writer，分别触发自动发现路径或显式 route 路径；
+第六，Checkpoint 触发时，Writer 对每个物理 route 调用底层 writer 的 \texttt{snapshotState(checkpointId)} 并封装状态；
+第七，提交阶段 \texttt{prepareCommit()} 生成 route 级 committable，再由 \texttt{DynamicKafkaCommitter} 分发提交；
+第八，故障恢复时，\texttt{restoreWriter(...)} 根据恢复态先重建已知 route writer，再执行一次强制刷新以对齐最新元数据。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{dynamic_sink_call_graph.png}
+  \caption{当前原型实现的分层调用关系与状态提交路径}
+  \label{fig:dynamic-sink-call-graph}
+\end{figure}
+
+图~\ref{fig:dynamic-sink-call-graph} 更贴近当前代码实现，它把应用层、连接器 API 层、Sink 运行时核心、
+元数据发现层以及状态与提交路径同时展示出来。与上一幅总体结构图相比，该图强调的是
+`DynamicJob`、`DynamicKafkaSinkBuilder`、`DynamicKafkaSinkWriter`、`AdminClient.listTopics()`、
+`snapshotState()` 与 `prepareCommit()` 等真实实现对象之间的依赖与流向，更适合放在实现细节部分作为说明。
+
+\section{本章小结}
+
+本章结合 \texttt{connector} 与 \texttt{app} 模块的真实代码，对动态 Kafka Sink 的设计与实现进行了细化说明。
+相较于仅停留在概念层面的描述，本文进一步交代了 route id 的构造方式、三张核心映射表的职责、
+显式 route 更新事件的传播路径、底层 \texttt{KafkaSink} writer 的复用方式，以及当前实现尚未解决的 writer 回收问题。
+这些内容共同构成了课题当前阶段的核心实现基础。

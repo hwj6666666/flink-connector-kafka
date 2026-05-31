@@ -1,0 +1,91 @@
+% !TEX root = ../main.tex
+
+\chapter{附录}
+
+\section{实验配置样例}
+\label{appendix:configs}
+
+为了避免在正文中反复插入过多配置细节，本文将实验所用的典型配置整理于本附录。
+这些配置仅用于驱动 connector 的验证，并不改变 connector 本身的设计与语义。
+
+\subsection{显式 route 与静态基线实验配置}
+
+\begin{codeblock}[caption={用于显式 route 与静态基线实验的配置样例}]
+dynamic:
+  cluster_id: default-cluster
+  topic: exp-dynamic
+  stream_pattern: "^exp-wjh.*$"
+  bootstrap_servers: localhost:9092
+  emit_interval_ms: 20
+  parallelism: 1
+  discovery_interval_ms: 2000
+  route_map:
+    route-a:
+      cluster_id: default-cluster
+      bootstrap_servers: localhost:9092
+      topic_regex: "^exp-dynamic-a$"
+    route-b:
+      cluster_id: default-cluster
+      bootstrap_servers: localhost:9092
+      topic_regex: "^exp-dynamic-b$"
+
+regular:
+  topic: exp-regular
+  bootstrap_servers: localhost:9092
+  emit_interval_ms: 20
+  parallelism: 1
+\end{codeblock}
+
+\subsection{自动发现延迟实验配置}
+
+自动发现延迟实验没有依赖显式 route map，而是使用 \texttt{AutoDiscoveryJob}
+生成不携带 \texttt{routeId} 的数据记录，并通过 \texttt{stream\_pattern} 驱动
+\texttt{DynamicKafkaSinkWriter.refreshRouteIfNeeded(...)} 进行 route 刷新。对应命令中使用的关键参数为：
+\texttt{bootstrap-servers=localhost:9092}、
+\texttt{cluster-id=default-cluster}、
+\texttt{stream-pattern=\^{}exp-auto-.*\$}、
+\texttt{emit-interval-ms=50}、
+\texttt{parallelism=1}、
+\texttt{discovery-interval-ms=2000}。
+
+\section{复现实验命令}
+\label{appendix:commands}
+
+本文实验主要通过以下几类命令复现：
+
+\begin{codeblock}[language=bash,caption={论文编译与字数统计命令}]
+./run.sh pdf
+./run.sh word
+\end{codeblock}
+
+\begin{codeblock}[language=bash,caption={根目录脚本提供的本地 Kafka/Flink 运行入口}]
+./run.sh setup
+./run.sh run dynamic
+./run.sh run regular
+\end{codeblock}
+
+\begin{codeblock}[language=bash,caption={自动发现延迟实验的核心执行命令示意}]
+java -cp app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar \
+  org.apache.flink.dynamic.sink.job.AutoDiscoveryJob \
+  --bootstrap-servers localhost:9092 \
+  --stream-pattern '^exp-auto-.*$' \
+  --cluster-id default-cluster \
+  --emit-interval-ms 50 \
+  --parallelism 1 \
+  --discovery-interval-ms 2000
+\end{codeblock}
+
+\begin{codeblock}[language=bash,caption={Checkpoint 与 Exactly-once 小规模验证命令示意}]
+java -cp app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar \
+  org.apache.flink.dynamic.sink.job.DynamicJob \
+  --bootstrap-servers localhost:9092 \
+  --stream-pattern '^exp-wjh-eo.*$' \
+  --cluster-id default-cluster \
+  --emit-interval-ms 10 \
+  --parallelism 1 \
+  --discovery-interval-ms 2000 \
+  --checkpoint-interval-ms 5000 \
+  --delivery-guarantee EXACTLY_ONCE \
+  --transactional-id-prefix thesis-eo-demo \
+  --config-file config.experiment.exactly_once.yaml
+\end{codeblock}

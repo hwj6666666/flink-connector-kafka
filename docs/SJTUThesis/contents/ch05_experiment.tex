@@ -1,0 +1,385 @@
+% !TEX root = ../main.tex
+
+\chapter{实验设计与结果分析}
+
+\section{实验环境与配置}
+
+本章实验的被测对象是 \texttt{connector} 模块中的动态 Kafka Sink 实现，尤其是
+\texttt{DynamicKafkaSink}、\texttt{DynamicKafkaSinkWriter}、\texttt{SingleClusterTopicMetadataService}
+与 \texttt{DynamicKafkaCommitter} 等核心类。为了对这些组件进行可重复验证，本文使用
+\texttt{app} 模块提供的若干轻量级作业作为实验载体，但这些作业本身并不是论文的主要交付对象。
+实验中使用的 Kafka 连接参数、\texttt{stream\_pattern}、\texttt{route\_map}、并行度与发射速率等配置，
+已统一整理至附录~\ref{appendix:configs}；相应运行命令整理于附录~\ref{appendix:commands}。
+
+数据源方面，原型并未直接接真实业务流，而是使用 \texttt{DataGeneratorSource} 周期性生成测试事件。
+\texttt{createRandomCsvSource(...)} 会随机选择一个 route id，并生成形如“时间戳,八位随机数,随机字符串”的文本消息。
+这样做的优点是实验可重复、易于控制发送速率，便于观察动态 Sink 在 route 刷新与多目标写入下的行为。
+
+从代码实现角度看，验证载体并不是简单地“持续发送随机字符串”，而是明确把发送速率、route 分布和消息格式都做成了可控变量。
+代码清单~\ref{code:dynamic-datagen} 展示了数据源的核心实现：当 \texttt{emit\_interval\_ms} 小于等于 0 时，
+作业会以尽可能高的速率持续生成数据；否则会通过 \texttt{RateLimiterStrategy.perSecond(...)} 近似控制吞吐。
+同时，route id 从 YAML 中加载出的 route 列表中均匀随机选择，因此该原型适合用于验证
+“在多逻辑 route 条件下，动态 Sink 是否能稳定分发与写出”。
+
+\begin{codeblock}[language=Java,caption={动态实验作业中的数据生成逻辑},label={code:dynamic-datagen}]
+private static DataGeneratorSource<DynamicSinkEvent> createRandomCsvSource(
+        long intervalMs, List<String> routeIds) {
+    GeneratorFunction<Long, DynamicSinkEvent> generator =
+            ignored -> {
+                ThreadLocalRandom random = ThreadLocalRandom.current();
+                String routeId = routeIds.get(random.nextInt(routeIds.size()));
+                return DynamicSinkEvent.data(routeId, generateRecord(random));
+            };
+    long recordsPerSecond = intervalMs <= 0 ? Long.MAX_VALUE : Math.max(1L, 1000L / intervalMs);
+    return new DataGeneratorSource<>(
+            generator,
+            Long.MAX_VALUE,
+            RateLimiterStrategy.perSecond(recordsPerSecond),
+            TypeInformation.of(DynamicSinkEvent.class));
+}
+\end{codeblock}
+
+需要说明的是，当前验证载体中的 \texttt{KafkaSinkBuilder} 为了优先完成原型验证，使用的是
+\texttt{DeliveryGuarantee.AT\_LEAST\_ONCE}；而 \texttt{DynamicKafkaSink} 的 builder 设计本身支持
+\texttt{NONE}、\texttt{AT\_LEAST\_ONCE} 与 \texttt{EXACTLY\_ONCE}，并可在 \texttt{EXACTLY\_ONCE} 模式下依赖底层事务提交路径。
+因此，本章实验结果主要反映三类内容：动态路由与动态发现机制的功能有效性、connector 与 Flink
+Checkpoint 的集成表现，以及 route 级 \texttt{EXACTLY\_ONCE} 在本地小规模条件下的可运行性。
+关于 connector 的 Checkpoint 集成机制与 Exactly-once 代码路径，本文已在第 4 章补充专门说明；
+本章则进一步给出对应的运行验证结果。
+
+\section{功能验证实验}
+
+\subsection{动态 Topic 发现验证}
+
+动态发现验证的目标，是确认 Writer 能否在作业不重启的前提下识别并使用新出现的 Topic。
+实验步骤可设计为：首先创建若干满足 \texttt{stream\_pattern} 的 Topic，并启动 \texttt{DynamicJob}；
+然后观察 \texttt{DynamicKafkaSinkWriter.refreshRouteIfNeeded(...)} 调用 \texttt{resolveRoutes()} 后，
+\texttt{activeRouteIds} 是否被正确填充，\texttt{clusterWritersByRouteId} 中是否创建了相应 route 的 \texttt{ClusterWriter}。
+在此基础上，再在 Kafka 中手动新增符合模式的 Topic，等待一个或多个 discovery interval 周期，
+验证新 Topic 是否被纳入 \texttt{activeRouteIds} 并开始接收消息。
+
+当前原型代码采用周期性全量刷新，因此这一实验关注的不仅是“能否发现”，还包括“多久发现”。
+只要 \texttt{stream-metadata-discovery-interval-ms} 为正值，Writer 就会在达到 \texttt{nextMetadataRefreshTimestamp} 后再次执行刷新；
+若该参数为非正值，则首次启动后的 route 集合将不再自动变化。因而，实验中需要记录 discovery interval 对最终可见时延的影响。
+
+为了对“新增 Topic 被发现并开始接收数据”的时间开销进行实测，本文进一步补充了一个专门面向自动发现路径的驱动程序
+\texttt{AutoDiscoveryJob}。与前文 \texttt{DynamicJob} 不同，该作业生成的是
+\texttt{DynamicSinkEvent.data(null, message)}，即不携带逻辑 \texttt{routeId} 的数据记录，
+从而强制 Writer 走 \texttt{refreshRouteIfNeeded(...)} 和 \texttt{activeRouteIds} 驱动的自动发现路径。
+实验过程中先创建一个与正则匹配的 seed Topic 作为初始可写目标，再在作业运行中连续创建新的匹配 Topic，
+并通过 \texttt{kafka-get-offsets} 轮询新 Topic 的 offset，记录“Topic 创建成功时刻”到“该 Topic 首次 offset 大于 0”之间的时间差。
+
+本次实验共进行了两轮重复测量，每轮连续创建 3 个新 Topic，共得到 6 个样本；其余运行参数与第 5.1 节所述环境保持一致。
+测量结果如表~\ref{tab:auto-discovery-latency} 所示。
+
+\begin{table}[htbp]
+  \centering
+  \caption{自动发现新增 Topic 的本地实测延迟}
+  \label{tab:auto-discovery-latency}
+  \begin{tabular}{cccc}
+    \toprule
+    轮次 & Topic 编号 & 首次写入延迟 / s & 首次观测 offset \\
+    \midrule
+    第 1 轮 & 1 & 1.077 & 14 \\
+    第 1 轮 & 2 & 2.412 & 23 \\
+    第 1 轮 & 3 & 1.095 & 8 \\
+    第 2 轮 & 1 & 1.103 & 14 \\
+    第 2 轮 & 2 & 2.418 & 24 \\
+    第 2 轮 & 3 & 1.074 & 10 \\
+    \midrule
+    \multicolumn{2}{c}{平均值} & 1.530 & -- \\
+    \multicolumn{2}{c}{中位数} & 1.099 & -- \\
+    \multicolumn{2}{c}{最小值} & 1.074 & -- \\
+    \multicolumn{2}{c}{最大值} & 2.418 & -- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+从表~\ref{tab:auto-discovery-latency} 可以看到，在 \texttt{discovery\_interval\_ms=2000} 的配置下，
+新增 Topic 的首次写入延迟稳定落在约 1.1 到 2.4 秒之间，平均值为 1.53 秒。
+其中第 2 个样本在两轮实验中都接近 2.4 秒，说明当 Topic 创建时刻恰好落在某次刷新之后时，
+需要等待下一轮元数据刷新才能被纳入 \texttt{activeRouteIds}；而其余样本约为 1.1 秒，
+则说明 Topic 创建时刻更接近下一次刷新触发点。该结果与当前实现的时间驱动刷新机制是吻合的，
+也表明在本地单机环境下，自动发现延迟的主导因素确实是配置的 discovery interval，而非 Kafka 写入本身。
+
+\subsection{自动订阅验证}
+
+自动订阅验证关注的是“发现之后，是否能真正写出”。当前实现中，route 发现本身并不直接发送消息，
+真正的写出动作要等到 \texttt{clusterWritersByRouteId.computeIfAbsent(...)} 创建出新的 \texttt{ClusterWriter} 之后，
+再由底层 \texttt{KafkaSink} writer 负责写出。实验应重点验证两点：
+一是新 route 被发现后，是否确实懒创建了底层 writer；二是普通数据事件进入 \texttt{write(...)} 后，
+是否会写入当前所有活动 route。
+
+需要如实指出，当前实现已经在非事务路径上补充了退役 writer 的清理逻辑：
+当某个 route 不再属于当前活动集合、且也不被显式逻辑 route 引用时，Writer 会在后续 flush、
+prepareCommit 或 snapshotState 之后调用清理逻辑将其关闭并移除。因此，自动订阅实验除了验证“新增 Topic 后能否自动扩写”，
+还可以进一步验证“删除逻辑 route 或修改规则后，旧 route writer 是否不再长期残留”。不过，对于
+\texttt{EXACTLY\_ONCE} 事务路径，当前实现仍未启用自动回收，因此这一部分仍属于后续工作。
+
+\subsection{动态路由验证}
+
+动态路由验证对应本文系统设计中的核心能力之一。实验中可先通过 \texttt{config.yaml} 配置 \texttt{route-a} 与 \texttt{route-b}，
+再由 \texttt{DynamicJob} 在作业启动时广播一次 route map 更新事件。\texttt{BroadcastProcessFunction} 会先把 route 写入广播状态，
+然后把同一条更新事件继续输出给 Sink；Sink 侧收到更新事件后，\texttt{DynamicKafkaSinkWriter.applyRouteUpdates(...)}
+把这些逻辑 route 写入 \texttt{explicitRoutesById}。
+
+在此之后，普通数据事件携带 route id 进入 Sink，\texttt{writeToExplicitRoute(...)} 会先解析逻辑 route id 对应的物理 route，
+再把数据写入解析得到的 Topic 集合。实验验证可从三个角度展开：
+第一，发送 route-a 的数据是否只会进入 route-a 对应的 Topic；
+第二，修改 route-a 的 \texttt{topic\_regex} 后，后续数据是否能在不重启作业的情况下切换到新匹配目标；
+第三，当某 route id 尚未被广播配置时，前置 \texttt{BroadcastProcessFunction} 是否会将其过滤掉，避免无效数据进入 Sink；
+第四，当广播事件显式删除某个 route 时，广播状态与 Sink 内部逻辑 route 表是否同步移除该 route。
+
+\subsection{显式路由与静态基线对照验证}
+
+考虑到短时、低速率实验得到的消息量偏小，不足以作为正文中的主要对照结果，本文重新补充了一组更大样本量的本地实验。
+为避免历史数据干扰，本次实验使用独立 Topic 集合；同时保留一个与 \texttt{stream\_pattern} 匹配的 seed Topic，
+以满足 \texttt{DynamicKafkaSinkWriter} 初始化阶段的 route 解析要求。除将数据源发射间隔收紧至 \texttt{5 ms}、
+单次运行时长提升到约 \texttt{30 s} 外，其余环境仍与第 5.1 节一致。DynamicJob 使用附录中的大样本实验配置，
+加载两条逻辑 route：\texttt{route-a} 映射到 \texttt{\^{}exp-dynamic-c\$}，
+\texttt{route-b} 映射到 \texttt{\^{}exp-dynamic-d\$}；RegularJob 则固定写入
+\texttt{exp-regular-2}。实验完成后，使用 \texttt{kafka-get-offsets} 读取各 Topic
+偏移量作为最终写入条数的近似统计结果，结果如表~\ref{tab:local-exp-results} 所示。
+
+\begin{table}[htbp]
+  \centering
+  \caption{本地单机环境下的大样本对照结果}
+  \label{tab:local-exp-results}
+  \begin{tabular}{ccccc}
+    \toprule
+    方案 & 目标 Topic 数 & 运行时间 / s & 输出总条数 & 近似吞吐 / 条$\cdot$s$^{-1}$ \\
+    \midrule
+    DynamicJob & 2 & 30 & 5742 & 191.4 \\
+    RegularJob & 1 & 30 & 5776 & 192.5 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+进一步查看 DynamicJob 的两个目标 Topic，可以得到
+\texttt{exp-dynamic-c=2812}、\texttt{exp-dynamic-d=2930}，分别占动态总写入量的
+49.0\% 与 51.0\%，说明随机生成的数据在两条逻辑 route 之间分布基本均衡，
+且没有出现某一路由长期偏斜或全部写向同一 Topic 的异常。
+
+从表~\ref{tab:local-exp-results} 可以得到三点更直接的结论。第一，显式路由路径在当前原型中已经能够稳定工作：
+在 30 秒、\texttt{emit\_interval\_ms=5} 的条件下，DynamicJob 能持续向两个物理 Topic 输出总计 5742 条记录。
+第二，同条件下静态基线写入 5776 条，约为 192.5 条/秒；动态方案写入 5742 条，约为 191.4 条/秒，
+两者吞吐差距约为 0.59\%，说明在本地单机、小规模显式 route 场景下，动态路由引入的额外运行时开销仍然较小。
+第三，两组实验的目标 Topic 集合彼此隔离，说明当前验证载体中的 route 过滤与 connector 内部的 route 解析逻辑在功能上是自洽的。
+
+需要如实说明的是，这一组大样本实测结果主要覆盖了“显式逻辑 route $\rightarrow$ 物理 Topic”路径，
+以及与传统静态 \texttt{KafkaSink} 的对照结果；而“自动发现路径在新增 Topic 后的发现时延”则由前文
+\texttt{AutoDiscoveryJob} 的单独实验进行量化。
+
+\subsection{Checkpoint 与恢复语义验证}
+
+为了验证当前 connector 是否真正接入了 Flink 的 Checkpoint 链路，本文为
+\texttt{DynamicJob} 显式打开了 \texttt{checkpoint-interval-ms=5000}，其余实验环境与第 5.1 节保持一致。
+该实验的关注点不是吞吐量本身，而是以下三个现象是否同时出现：其一，作业运行期间能够周期性触发 Checkpoint；
+其二，\texttt{DynamicKafkaSinkWriter.snapshotState(...)} 对应的 route 级状态能够被框架正常接纳；
+其三，Checkpoint 完成后 source 端和 sink 端都能看到“checkpoint completed”的协同日志。
+
+本次验证运行约 22 秒，在日志中观察到连续 5 次成功 Checkpoint，
+其完成时延分别为 476 ms、11 ms、22 ms、19 ms 和 21 ms；若去除首次冷启动影响，
+稳态 Checkpoint 完成时延平均约为 18.2 ms。与此同时，日志中可见
+\texttt{Source: id-message-source} 与 \texttt{Source: Collection Source} 都收到了
+“Marking checkpoint as completed”的通知，说明当前验证载体中的 source、广播控制流和动态 Sink
+确实共同参与了 Flink 的一致性快照过程。
+
+这一结果与第 4 章的设计分析是吻合的：当前 connector 并不是在 Checkpoint 之外单独维护一套
+外部状态，而是通过 \texttt{DynamicKafkaSinkWriterState} 把 route 级 writer 状态纳入
+Flink 原生的快照与恢复机制之中。因此，从正常运行路径的角度看，当前 connector 已经具备与
+Flink Checkpoint 机制协同工作的基本能力。
+
+\subsection{Exactly-once 语义验证}
+
+在上述 Checkpoint 验证基础上，本文进一步对 \texttt{EXACTLY\_ONCE} 语义进行了本地小规模验证。
+实验使用与前文类似的显式 route 驱动方式，但在运行参数中额外指定
+\texttt{delivery-guarantee=EXACTLY\_ONCE}、
+\texttt{checkpoint-interval-ms=5000} 和唯一的 \texttt{transactional-id-prefix}。
+考虑到本地 Kafka broker 对事务超时的限制，验证载体在 \texttt{EXACTLY\_ONCE} 模式下使用了更保守的
+\texttt{transaction.timeout.ms=60000}，以保证事务生产者能够正常初始化。这一调整不改变 connector 的语义设计，
+仅用于适配本地实验环境。
+
+\begin{table}[htbp]
+  \centering
+  \caption{本地单机环境下的 Exactly-once 小规模验证结果}
+  \label{tab:exactly-once-validation}
+  \begin{tabular}{ccccc}
+    \toprule
+    运行模式 & Checkpoint 间隔 / s & 成功 Checkpoint 次数 & 输出总条数 & 近似吞吐 / 条$\cdot$s$^{-1}$ \\
+    \midrule
+    EXACTLY\_ONCE & 5 & 5 & 2092 & 95.1 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+进一步查看两个目标 Topic 的 committed offset，可以得到
+\texttt{exp-eo-a=1084}、\texttt{exp-eo-b=1008}，分别占总输出的 51.8\% 与 48.2\%，
+说明在事务型提交路径下，route 级分发仍保持了与前文显式 route 实验相近的均衡性。
+更重要的是，本次运行日志中未出现事务前缀冲突、提交失败或事务初始化异常；
+5 次 Checkpoint 均成功完成，且两个目标 Topic 最终都出现了 committed 输出。
+这表明当前 connector 的 route 级 \texttt{DynamicKafkaCommittable} 与
+\texttt{DynamicKafkaCommitter} 路径在本地单机条件下能够正常工作，
+其 \texttt{EXACTLY\_ONCE} 设计并不只是停留在接口层面，而是已经能够通过小规模实验得到验证。
+
+\section{性能测试与分析}
+
+\subsection{延迟分析}
+
+从代码实现看，动态 Sink 的时延至少包含三部分：数据生成到进入 Writer 的常规流水线延迟、
+Kafka producer 发送与 broker 确认延迟，以及最关键的“Topic 变化发现延迟”。
+其中前两者与普通 KafkaSink 类似，第三部分由动态机制额外引入。
+
+对发现延迟的测量可定义为：从某个新 Topic 在 Kafka 集群中创建成功开始计时，到第一条写入该 Topic 的消息被消费到为止。
+这一指标主要受 discovery interval、\texttt{AdminClient.listTopics()} 的执行时间和 Flink 任务线程调度影响。
+例如，在示例配置 discovery interval 为 \texttt{2000 ms} 时，理论上新 Topic 的最早可见时间不会早于下一次刷新触发点。
+若后续引入缓存或增量元数据策略，可将优化前后的发现时延进行对比。
+
+为了避免本节继续停留在概念层面，本文将前文已经得到的自动发现与 Checkpoint 时延结果汇总为表~\ref{tab:latency-results}。
+其中，自动发现延迟来自 \texttt{AutoDiscoveryJob} 的两轮共 6 个样本；Checkpoint 时延来自
+\texttt{EXACTLY\_ONCE} 本地验证中的 5 次成功快照。
+
+\begin{table}[htbp]
+  \centering
+  \caption{延迟测试结果}
+  \label{tab:latency-results}
+  \begin{tabular}{ccccc}
+    \toprule
+    指标 & 样本数 & 平均值 & 中位数/稳态均值 & 取值范围 \\
+    \midrule
+    自动发现延迟 / s & 6 & 1.530 & 1.099 & 1.074--2.418 \\
+    Checkpoint 完成时延 / ms & 5 & 109.8 & 18.2 & 11--476 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+从表~\ref{tab:latency-results} 可以看到，自动发现延迟稳定落在约 1.1--2.4 秒之间，
+与 \texttt{discovery\_interval\_ms=2000} 的配置相吻合，说明当前实现中的时间驱动刷新机制确实主导了新 Topic 的可见时延。
+而 Checkpoint 完成时延的平均值之所以达到 109.8 ms，主要是首次冷启动快照耗时较高（476 ms）所致；
+若只观察后续 4 次稳态 Checkpoint，则平均完成时延约为 18.2 ms，说明在本地单机、小规模 route 数量条件下，
+route 级状态快照并未引入显著的额外阻塞。
+
+\subsection{吞吐量分析}
+
+吞吐量分析关注 route 数量增长对系统写入能力的影响。由于当前实现对每个物理 route 都维护一个底层 \texttt{KafkaSink} writer，
+并且自动发现路径会把普通消息广播写入全部 \texttt{activeRouteIds}，因此 route 数越多，单条消息触发的实际发送次数越多，
+CPU、网络与内存开销也会同步增加。实验可通过逐步增加 route 数量、并在固定并行度下提升数据源发射速率，
+观察系统的稳定吞吐上限。
+
+结合当前代码结构，吞吐实验至少应同步记录三类运行时指标。第一类是输入侧速率，可由
+\texttt{emit\_interval\_ms} 或 \texttt{recordsPerSecond} 直接换算；第二类是动态机制带来的管理成本，
+例如 \texttt{clusterWritersByRouteId.size()}、\texttt{activeRouteIds.size()} 与 route 解析耗时；
+第三类是提交与快照成本，可围绕 \texttt{prepareCommit()} 生成的
+\texttt{DynamicKafkaCommittable} 数量以及 \texttt{snapshotState(...)} 输出的 route 状态条数进行统计。
+只有把这几类指标同时观察，才能区分“Kafka 写入瓶颈”和“动态管理逻辑带来的额外成本”。
+
+除了总吞吐量外，还应关注 \texttt{clusterWritersByRouteId} 规模增长对资源占用的影响。当前版本已经在非事务路径上
+实现了退役 writer 清理，因此历史 route 的累积问题已有所缓解；但在 \texttt{EXACTLY\_ONCE} 路径下，
+由于尚未启用相同的自动回收策略，writer 生命周期管理仍是后续性能优化与一致性验证的重要内容。
+
+表~\ref{tab:throughput-results} 汇总了本章中与吞吐相关的几组实测结果。为保证可比性，
+除 \texttt{EXACTLY\_ONCE} 验证组外，其余实验均在本地单机、\texttt{parallelism=1}、
+\texttt{emit\_interval\_ms=5} 的条件下运行约 30 秒。4-route 动态组的输出总量按 Topic offset 增量统计，
+因为其中两个 Topic 复用了前一组 2-route 实验所创建的主题。
+
+\begin{table}[htbp]
+  \centering
+  \caption{吞吐测试结果}
+  \label{tab:throughput-results}
+  \begin{tabular}{ccccc}
+    \toprule
+    方案 & 运行模式 & 活动 route / Topic 数 & 输出总条数 & 近似吞吐 / 条$\cdot$s$^{-1}$ \\
+    \midrule
+    静态基线 & AT\_LEAST\_ONCE & 1 & 5776 & 192.5 \\
+    动态写入（2-route） & AT\_LEAST\_ONCE & 2 & 5742 & 191.4 \\
+    动态写入（4-route） & AT\_LEAST\_ONCE & 4 & 5763 & 192.1 \\
+    动态写入（2-route） & EXACTLY\_ONCE & 2 & 2092 & 95.1 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+从表~\ref{tab:throughput-results} 可以得到三点观察。第一，在 \texttt{AT\_LEAST\_ONCE} 条件下，
+静态基线、2-route 动态和 4-route 动态三组实验的吞吐都稳定在约 191--193 条/秒范围内，
+说明在本地单机、小规模 route 数量场景下，动态 route 管理尚未成为主导瓶颈。
+第二，4-route 动态组并未明显低于 2-route 动态组，这表明在当前实验规模下，
+route 数量从 2 增长到 4 还没有把写放大成本放大到足以压低整体吞吐的程度；
+这也说明在当前本地实验规模下，route 数量的轻微增长尚未转化为显著的吞吐差异。
+第三，当切换到 \texttt{EXACTLY\_ONCE} 后，吞吐下降到约 95.1 条/秒，约为
+\texttt{AT\_LEAST\_ONCE} 动态 2-route 结果的一半，这说明事务初始化、Checkpoint 协同和 route 级提交
+确实带来了更高的运行成本，也与 \texttt{EXACTLY\_ONCE} 语义更强调一致性而非极致吞吐的设计目标相符。
+
+\subsection{性能结果分析}
+
+综合本节结果可以看到，在本地单机和小规模 route 数量条件下，当前 connector 的性能瓶颈仍主要体现在事务提交路径，
+而不是 2 到 4 个 route 之间的 writer 管理差异。这也说明，如果后续要评估更大规模动态目标集合下的扩展边界，
+仍需要在分布式环境中进一步补充更高 route 数量、更高并行度和更长运行时间的系统性测试。
+
+\section{对比实验与结果分析}
+
+\subsection{静态订阅方案对比}
+
+静态基线可选用传统 \texttt{KafkaSink}：由应用层在构建作业时直接指定固定 Topic，运行期间 Topic 不会自动更新。
+与其相比，动态 Sink 的主要优势不在于单条消息的绝对发送速度，而在于 Topic 变化时无需停机重启。
+因此，对比实验应包含两类指标：
+一类是功能性指标，如 Topic 增删后是否需要手动重启作业、恢复到可写状态所需时间；
+另一类是性能指标，如在相同发送速率下两种方案的平均吞吐与资源占用差异。
+
+该静态基线在本仓库中已有对应实现，即 \texttt{RegularJob}。从代码清单~\ref{code:regular-baseline}
+可以看到，基线方案只需要把固定 Topic 直接写入 \texttt{KafkaRecordSerializationSchema}，
+不会涉及元数据轮询、逻辑 route 更新或多 writer 管理。也正因为如此，静态方案的实现复杂度和运行时开销都更低，
+但代价是每当目标 Topic 集合发生变化时，必须通过重新构建或重启作业来完成切换。
+
+\begin{codeblock}[language=Java,caption={静态 KafkaSink 基线方案的核心构造逻辑},label={code:regular-baseline}]
+KafkaSink<String> sink =
+        KafkaSink.<String>builder()
+                .setBootstrapServers(bootstrapServers)
+                .setRecordSerializer(
+                        KafkaRecordSerializationSchema.<String>builder()
+                                .setTopic(topic)
+                                .setValueSerializationSchema(new SimpleStringSchema())
+                                .build())
+                .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+                .build();
+\end{codeblock}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\textwidth]{offline_update_architecture.png}
+  \caption{传统停机更新架构示意}
+  \label{fig:offline-update-architecture}
+\end{figure}
+
+图~\ref{fig:offline-update-architecture} 给出了传统停机更新架构的典型流程：当规则或目标系统发生变化时，
+通常需要先停机维护、停止写入，再更新规则引擎或输出配置，最后恢复业务系统的下游接入。
+这一模式虽然容易理解，但会把“配置变化”直接转化为“业务链路停顿”，因此非常适合作为本文动态方案的静态对照基线。
+
+预计静态方案在“拓扑稳定、只写单 Topic”的场景下具有更低实现开销，因为它没有元数据轮询与多 writer 管理成本；
+而动态方案在 Topic 经常变化的场景下，更能体现自动化与持续运行优势。
+
+\subsection{正则订阅方案对比}
+
+若仅与 Source 侧正则订阅能力相比，动态 Sink 的创新点不在“正则本身”，而在“把正则匹配结果落到写入路径上”。
+Source 侧 FLIP-246 关注的是消费订阅集合与分区变化，Sink 侧则需要处理 Producer 配置、Topic 绑定、
+writer 状态快照与 route 级提交等问题，二者虽然都依赖元数据发现，但内部代价结构并不相同。
+因此，本课题的对比分析应强调：动态 Sink 不是简单把 Source 的正则订阅搬到写端，
+而是在写入端增加了一层 route 级 writer 管理与提交逻辑。
+
+\subsection{本文方案优势分析}
+
+结合当前原型，可以把本文方案的优势概括为三点。第一，面向 Topic 频繁增删的场景，
+系统能够在 discovery interval 驱动下自动扩写新的目标，不需要人工修改作业配置并重新发布。第二，
+通过 \texttt{DynamicSinkEvent} 与 \texttt{KafkaRouteDestination} 的组合，系统把“业务路由”与“Kafka 物理目标”解耦，
+使 route 调整可以通过广播更新在运行期完成。第三，动态 Sink 并未重写整套 Kafka 提交逻辑，
+而是把每个 route 下沉为一个普通 \texttt{KafkaSink} writer，再通过 route 级状态与 committable 包装复用现有实现，
+降低了原型开发复杂度。
+
+与此同时，当前实现的成本也十分明确：需要周期性访问 AdminClient；route 越多，writer 管理越复杂；
+自动发现路径默认对所有活动 route 广播写入，可能放大写放大开销；route 回收与 Exactly-once 的系统化验证仍待完成。
+因此，本文方案更适合作为“动态写入机制原型与可行性验证”，后续还需要在工程化层面继续打磨。
+
+\section{本章小结}
+
+本章围绕当前 connector 的核心能力给出了功能验证与性能结果：前者覆盖动态 Topic 发现、显式 route 分发、
+Checkpoint 集成与 \texttt{EXACTLY\_ONCE} 小规模验证，后者则通过延迟与吞吐两类实测结果说明了
+本地单机、小规模 route 数量条件下的运行特征。整体来看，当前实现已经能够支撑动态写入机制的可行性验证；
+而面向更大规模动态目标集合的扩展边界，仍需要在分布式环境下做进一步测试。

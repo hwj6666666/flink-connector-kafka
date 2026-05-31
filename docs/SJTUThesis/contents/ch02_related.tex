@@ -1,0 +1,143 @@
+% !TEX root = ../main.tex
+
+\chapter{相关技术与理论基础}
+
+\section{Kafka 消息队列技术}
+
+\subsection{Kafka 基本架构}
+
+Apache Kafka 以分布式、可持久化的日志抽象为核心，Broker 集群负责 Topic 数据的存储与复制，
+Producer 与 Consumer 通过客户端与集群交互\cite{kreps2011kafka}。
+管理侧通常借助 AdminClient 查询或变更集群元数据（如 Topic 列表、分区信息），
+这是实现“运行期发现 Topic 变化”的基础能力。对于本文所关注的动态 Sink 问题而言，
+Kafka 不仅是下游消息系统，更是“被动态感知和动态绑定的外部目标系统”。因此，
+理解 Kafka 的 Broker、Topic、分区、副本与客户端配置方式，是后续分析动态发现、route 构造与 producer 管理的前提。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.9\textwidth]{kafka_flink_pipeline.png}
+  \caption{Kafka 与 Flink 组成的典型实时数据流水线}
+  \label{fig:kafka-flink-pipeline}
+\end{figure}
+
+图~\ref{fig:kafka-flink-pipeline} 展示了 Kafka 与 Flink 在实时数据链路中的典型位置：
+多类数据源先汇入 Kafka，Flink 再作为中间处理与分析引擎，将结果写入下游数据汇聚系统或业务系统。
+本文所研究的动态 Sink，正位于这一链路的“Flink 写出下游”位置，其目标不是替代 Kafka 或 Flink，
+而是在二者集成边界上增强写入端的动态适配能力。
+
+\subsection{Topic 与 Partition 机制}
+
+Topic 是逻辑上的消息类别，其下可划分为多个分区以实现并行与扩展。
+消息在分区内有序，分区之间则相对独立。动态写入场景下，业务往往需要在多个 Topic 之间分发记录，
+因此既要理解 Topic—分区的命名与元数据组织，也要关注新增 Topic 被集群接纳后的可见时序。
+对于当前原型而言，\texttt{SingleClusterTopicMetadataService} 通过 \texttt{AdminClient.listTopics()} 获取的是 Topic 集合，
+而不是更细粒度的 partition 变化；因此本文的“动态发现”主要发生在 Topic 粒度。
+不过，一旦 route 被解析为具体 Topic，底层 \texttt{KafkaSink} 仍会在发送阶段根据 Topic 的分区情况选择分区，
+这说明 Topic 动态发现与底层 partition 写入是分层协作关系，而不是互相替代关系。
+
+\subsection{消费者组与消费模型}
+
+消费者通过消费者组实现负载分担与容错：同一组内消费者协同消费订阅的分区集合。
+虽然本文重点在 Sink 侧的生产写入，但消费模型体现了 Kafka 客户端与协调器、元数据交互的典型模式；
+AdminClient 拉取 Topic 列表、协调订阅集合的更新，在思路上与“动态维护目标集合”具有可比性。
+Source 侧的动态订阅通常面向“应消费哪些 Topic / partition”，而本文所研究的 Sink 侧问题，
+则面向“应写入哪些 Topic / route”。二者在语义上不同，但都离不开元数据刷新、客户端生命周期管理和故障恢复后的重新对齐。
+
+\section{Flink 流处理框架}
+
+\subsection{Flink 体系结构}
+
+Flink 提供分布式数据流上的有状态计算能力，支持事件时间与窗口语义，
+并通过 Checkpoint 与分布式快照思想实现容错\cite{carbone2015flink}。
+作业由 JobManager 与 TaskManager 协同执行，算子链路与网络拓扑在运行期相对稳定，
+而连接器层则承担与外部系统的数据交换，是扩展动态行为的重要切入点。
+从本文原型的实现看，动态能力并未深入修改 Flink 核心调度器，而是集中落在连接器 writer 层：
+应用作业负责生成数据与广播配置，运行时框架负责执行算子与 Checkpoint，
+动态 Sink 则在此基础上扩展出 route 刷新、writer 管理与 route 级提交逻辑。
+
+\subsection{DataStream 编程模型}
+
+DataStream API 以无界流为抽象，用户通过 Source、Transformation、Sink 组装流水线。
+Sink 负责将算子输出持续写出到外部系统；统一 Sink API 将写入逻辑封装为 Writer、
+提交与状态快照等接口，便于与 Flink 运行时集成\cite{flinkKafkaDocs,flinkUnifiedSink}。
+在本文所基于的实现中，\texttt{DynamicKafkaSink} 直接实现了
+\texttt{TwoPhaseCommittingStatefulSink<IN, DynamicKafkaSinkWriterState, DynamicKafkaCommittable>}，
+这意味着动态 Sink 并没有绕开统一 Sink 模型，而是显式复用了“Writer 状态 + Committer”这一路径。
+因此，本课题在方法上更偏向于“在现有 Sink API 之上扩展动态行为”，而非重写一套独立的写入框架。
+
+\subsection{状态管理与一致性机制}
+
+有状态算子将中间结果保存在托管状态中；Checkpoint 周期性地对算子状态与数据源偏移等信息做一致性快照，
+故障恢复时从最近一次成功快照回放。动态 Sink 若维护“Topic—写入通道”等映射关系，
+需要将相关状态纳入快照与恢复路径，才能保证重启后行为与元数据现实一致。
+当前代码中，\texttt{DynamicKafkaSinkWriterState} 记录 route 标识、目标 cluster 与 topic、
+事务前缀、producer 配置以及底层 \texttt{KafkaWriterState}；\texttt{DynamicKafkaCommittable} 则把底层
+\texttt{KafkaCommittable} 与 route 元数据绑定，使 \texttt{DynamicKafkaCommitter} 可以按 route 分发提交请求。
+这些设计共同说明：动态 Sink 的状态不是“单一全局状态”，而是以 route 为基本单元的组合状态。
+
+\section{Flink Kafka Connector}
+
+\subsection{静态 Topic 订阅方式}
+
+常规配置在作业构建阶段指定固定的 Topic 名称或静态列表，运行期不随集群侧 Topic 集合变化而自动扩展。
+该方式实现简单、语义清晰，适用于拓扑稳定的场景，但在 Topic 频繁增删或按规则批量创建时，
+难以避免停启作业与重复发布。本文原型中的对照组也可以理解为这种典型静态模式：
+应用在作业提交前就把目标 Topic 写死到 \texttt{KafkaSink} 中，之后任何目标变更都需要重新构建并部署作业。
+因此，静态模式更适合作为本文后续实验中的基准方案，而不是待研究问题的最终答案。
+
+\subsection{基于正则的订阅机制}
+
+在 Source 侧，社区已支持基于正则表达式匹配 Topic 名称的订阅方式，并与分区发现、
+偏移提交等机制结合\cite{flip246}。其本质是周期或事件驱动地比对“模式—当前元数据”，
+更新实际订阅集合。Sink 侧若要对齐类似能力，需要另行设计生产者实例生命周期与记录路由策略，
+不能简单照搬 Source 实现。本文当前代码中对“按模式发现 Topic”的实现落在
+\texttt{DynamicKafkaSinkBuilder.setStreamPattern(...)}、\texttt{StreamPatternSubscriber} 与
+\texttt{SingleClusterTopicMetadataService} 的组合上；但当模式命中新的 Topic 后，
+系统还要进一步将其转换为 route id、Kafka producer 配置和底层 writer，
+这一步正是 Sink 侧相较 Source 侧的主要额外复杂度。
+
+为了更直观地对应本仓库中的实现逻辑，代码清单~\ref{code:metadata-and-pattern}
+展示了当前原型中最关键的两步：先通过 \texttt{AdminClient.listTopics()} 拉取所有 Topic，
+再通过正则对 \texttt{streamId} 执行匹配。这说明本文方案中的“动态发现”并不是来自
+Flink 运行时的内建事件通知，而是构建在 Kafka 管理面元数据轮询之上的。
+
+\begin{codeblock}[language=Java,caption={当前原型中的 Topic 元数据获取与正则匹配逻辑},label={code:metadata-and-pattern}]
+// connector/.../SingleClusterTopicMetadataService.java
+public Set<KafkaStream> getAllStreams() {
+    return getAdminClient().listTopics().names().get().stream()
+            .map(this::createKafkaStream)
+            .collect(Collectors.toSet());
+}
+
+// connector/.../StreamPatternSubscriber.java
+public Set<KafkaStream> getSubscribedStreams(KafkaMetadataService kafkaMetadataService) {
+    Set<KafkaStream> allStreams = kafkaMetadataService.getAllStreams();
+    List<KafkaStream> matches = new ArrayList<>();
+    for (KafkaStream kafkaStream : allStreams) {
+        String streamId = kafkaStream.getStreamId();
+        if (streamPattern.matcher(streamId).find()) {
+            matches.add(kafkaStream);
+        }
+    }
+    return Set.copyOf(matches);
+}
+\end{codeblock}
+
+结合代码可以看到，当前实现默认把 \texttt{streamId} 等价为 Topic 名称，因此
+\texttt{stream\_pattern} 实际上就是“对 Topic 名称做匹配”的正则表达式。这样做实现简单，
+也便于原型阶段验证功能；但如果未来扩展到“逻辑流名称”与“物理 Topic 名称”并不完全一致的场景，
+则需要在 \texttt{KafkaStream} 的建模上进一步引入更丰富的元数据层次。
+
+\subsection{存在的问题与局限性}
+
+现有 Kafka Sink 在统一 API 下仍以静态目标为主；FLIP-515\cite{flip515} 等工作讨论动态 Sink 的方向，
+但生产可用的完整方案需处理：元数据扫描开销、写入路径与事务语义、状态快照与恢复后的对账等问题。
+从当前原型实现看，这些难点都已经在代码层面有所体现：例如 route 级 writer 的惰性创建已经实现，
+而 route 失活后的及时回收尚未实现；route 级提交包装已经具备，但 \texttt{EXACTLY\_ONCE} 的复杂故障验证仍待补足。
+因此，Flink Kafka Connector 的“动态化”并不是单点功能，而是一组围绕 Writer、状态、提交与元数据服务的协同扩展。
+
+\section{本章小结}
+
+本章回顾了 Kafka 的架构与元数据访问方式、Flink 流处理与状态容错模型，
+并结合当前代码实现，说明了为什么动态 Topic 发现、route 解析、writer 生命周期管理与 route 级状态恢复
+是同一个问题链条上的不同环节。这些技术基础为后续的需求分析、系统设计与实验验证提供了理论与实现上的双重依据。

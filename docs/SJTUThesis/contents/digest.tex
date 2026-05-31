@@ -1,0 +1,64 @@
+% !TEX root = ../main.tex
+
+\begin{digest}
+在实时数据基础设施不断演进的背景下，Apache Kafka 与 Apache Flink 的组合已经成为构建事件驱动系统、
+日志处理系统与实时分析平台的常见技术方案。Kafka 负责高吞吐、可持久化的消息传输与存储，
+Flink 则负责对持续到来的数据流执行状态计算、容错恢复和结果输出。二者在工程实践中往往协同工作：
+上游系统将业务事件、日志或监控数据写入 Kafka，下游 Flink 作业从中消费、处理，再把结果写入新的 Kafka Topic、
+数据库或其它外部系统。随着系统规模扩大，业务模型和下游系统拓扑会持续变化，传统静态配置的 Kafka Sink
+逐渐暴露出灵活性不足的问题。
+
+现有 Flink Kafka Sink 的典型使用方式，是在作业构建阶段显式指定目标 Topic、Kafka 集群连接参数、
+序列化器和交付语义。该方式在拓扑稳定的场景中实现简单、行为清晰，但在目标 Topic 会动态扩张、拆分、迁移，
+或业务希望按逻辑 route 运行期动态切换写入目标的场景中，就会引入较高的运维成本。每当目标 Topic 集合发生变化，
+应用往往需要停机修改配置、重新打包和重新部署作业，这不仅影响链路连续性，也会增大恢复窗口和人工操作成本。
+相比之下，消费端关于动态订阅的研究与实现已相对成熟，而生产端关于动态 Topic 发现和动态写入路径组织的工作仍较少，
+这构成了本文选题的直接背景。
+
+围绕这一问题，本文以现有 Flink Kafka 连接器代码为基础，设计并实现了一套面向 Sink 侧的动态 Topic 发现与订阅机制。
+论文的核心交付物集中在 \texttt{connector} 模块，包括 \texttt{DynamicKafkaSink}、
+\texttt{DynamicKafkaSinkBuilder}、\texttt{DynamicKafkaSinkWriter}、
+\texttt{SingleClusterTopicMetadataService}、\texttt{DynamicKafkaSinkWriterState}、
+\texttt{DynamicKafkaCommittable} 与 \texttt{DynamicKafkaCommitter} 等组件。
+这些组件共同构成了一个“动态外壳 + 静态内核”的设计：外层负责运行期 route 解析、Topic 元数据刷新、
+多 writer 管理、状态组织和提交分发；内层则尽可能复用已有的 \texttt{KafkaSink} writer、状态与事务提交链路，
+从而在较小改动范围内扩展动态能力。
+
+在总体设计上，本文将动态写入问题拆解为四个互相协作的部分。第一部分是元数据发现，
+即通过 \texttt{SingleClusterTopicMetadataService} 使用 Kafka \texttt{AdminClient} 拉取当前可见 Topic 集合，
+并将其封装为统一的 \texttt{KafkaStream} 抽象。第二部分是匹配与解析，
+即通过 \texttt{StreamPatternSubscriber} 和 \texttt{resolveRoutes()} 等逻辑，
+把满足模式匹配条件的 Topic 解析为可写 route 集合。第三部分是动态 writer 管理，
+即在 \texttt{DynamicKafkaSinkWriter} 内部以 route 为粒度懒创建底层 \texttt{KafkaSink} writer，
+并在非事务路径下清理退役 route 对应的旧 writer。第四部分是状态与提交路径，
+即把底层 Kafka writer 的状态封装为 \texttt{DynamicKafkaSinkWriterState}，
+把底层提交对象封装为 \texttt{DynamicKafkaCommittable}，再由 \texttt{DynamicKafkaCommitter}
+按 route 进行分组提交。
+
+本文实现的动态能力主要体现在两条路径。第一条是自动发现路径：
+Writer 会按照配置的 \texttt{stream-metadata-discovery-interval-ms} 周期性刷新元数据，
+重新计算当前活动 route 集合，并将普通数据写入所有 \texttt{activeRouteIds} 对应的物理目标。
+第二条是显式逻辑 route 路径：系统通过 \texttt{DynamicKafkaRouteEvent}、
+\texttt{DynamicSinkEvent} 和 \texttt{KafkaRouteDestination} 把业务 route 与物理 Topic 解耦，
+运行期可通过广播更新事件对 route 进行新增、覆盖或删除，并在下一次写入时完成 route 重新解析。
+这两条路径共享同一个动态 Sink 运行时，实现了“自动发现”和“逻辑路由”并存的动态写入模型。
+
+为了验证所提出方案的有效性，本文构建了多个轻量级实验载体，对 connector 的核心能力进行验证。
+在动态发现实验中，新增 Topic 被识别并开始接收数据的延迟稳定落在约 1.1 秒到 2.4 秒之间，
+与 \texttt{discovery\_interval\_ms=2000} 的配置相吻合，说明当前实现中的时间驱动元数据刷新机制确实主导了发现时延。
+在显式 route 与静态基线对照实验中，动态 2-route 写入与静态 1-topic 写入的吞吐均稳定在每秒 190 余条的量级，
+说明在本地单机、小规模 route 数量下，动态 route 管理尚未成为显著瓶颈。进一步地，
+本文还对 \texttt{EXACTLY\_ONCE} 路径做了小规模验证，结果表明 route 级事务提交链路能够在本地环境中正常运行，
+同时 Checkpoint 机制能够与当前 connector 协同工作，说明动态 Sink 已经具备与 Flink 原生容错链路结合的基础能力。
+
+从论文结论看，本文已经证明：基于统一 Sink API 的 KafkaSink 扩展出动态 Topic 发现、
+逻辑 route 与物理 Topic 解耦、route 级状态封装与提交分发，是一条可行的实现路径。
+相比完全重写一套 Kafka 生产端逻辑，当前方案通过复用既有 KafkaSink 的 writer 与提交机制，
+在保证代码结构清晰的同时提升了工程可落地性。与此同时，本文也明确指出了当前实现的局限，
+如元数据轮询成本、自动发现路径下可能存在的写放大、\texttt{EXACTLY\_ONCE} 路径中退役 writer 的安全回收、
+以及更大规模分布式场景下的系统化验证仍有待进一步完善。
+
+总体而言，本文围绕“基于 Flink 的动态 Kafka Topic 发现与订阅机制”完成了从问题分析、方案设计、
+代码实现到实验验证的完整过程。对于学士学位论文而言，本工作不仅实现了一个可运行的动态 Kafka Sink 原型，
+还系统说明了其设计思路、关键机制与实验结果，具备较好的工程实践价值和一定的方法论意义。
+\end{digest}
