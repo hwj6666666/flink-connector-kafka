@@ -1,10 +1,6 @@
 % !TEX root = ./main.tex
 
-% 模板默认 zh+en 双扉页；双面 + openright 会在英文扉页前插入空白页。
-% 仅保留中文扉页时改为只含 zh（须在 \sjtusetup 之前执行）。
-\ExplSyntaxOn
-\clist_gset:Nn \g__sjtu_lang_clist { zh }
-\ExplSyntaxOff
+% SJTUThesis 默认输出中文与英文题目页。
 
 \sjtusetup{
   %
@@ -21,7 +17,7 @@
     % 标题
     %
     zh / title           = {基于 Flink 的动态 Kafka-Topic 发现与订阅机制研究},
-    en / title           = {A Sample Document for \LaTeX-based SJTU Thesis Template},
+    en / title           = {RESEARCH ON DYNAMIC KAFKA TOPIC DISCOVERY AND SUBSCRIPTION MECHANISM BASED ON FLINK},
     %
     % 标题页标题
     %   可使用“\\”命令手动控制换行
@@ -31,13 +27,13 @@
     %
     % 关键词
     %
-    zh / keywords        = {Flink, Kafka, 动态 Topic, Sink, 流处理, 路由映射},
-    en / keywords        = {SJTU, master thesis, XeTeX/LaTeX template},
+    zh / keywords        = {Flink, Kafka, 动态 Topic, 流处理, 路由映射},
+    en / keywords        = {Flink, Kafka, dynamic topic, stream processing, route mapping},
     %
     % 姓名
     %
     zh / author          = {胡文杰},
-    en / author          = {Mo Mo},
+    en / author          = {\textbf{Wenjie Hu}},
     %
     % 学号
     %
@@ -46,7 +42,7 @@
     % 指导教师
     %
     zh / supervisor      = {任锐},
-    en / supervisor      = {Prof.\ Mou Mou},
+    en / supervisor      = {\textbf{Rui Ren}},
     %
     % 副指导教师
     %
@@ -60,30 +56,30 @@
     % 所属院系
     %
     zh / department      = {计算机学院},
-    en / department      = {Depart of XXX},
+    en / department      = {School of Computer Science},
     %
     % 专业
     %
     zh / major           = {软件工程},
-    en / major           = {A Very Important Major},
+    en / major           = {Software Engineering},
     %
     % 学位
     %   除交叉学科门类外，各一级学科按所属学科门类申请学位
     %   专业学位类别按专业名称申请学位
     %   本科生不需要填写
     %
-    zh / degree          = {工学学士},
+    zh / degree          = {学士},
     en / degree          = {Bachelor of Engineering},
     %
     % 答辩日期
     %   使用 ISO 格式 (yyyy-mm-dd)；默认为当前时间
     %
-    % date                 = {2023-05-18},
+    date                 = {2026-05},
     %
     % 标题页显示日期
     %   覆盖对应标题页的日期显示，原样输出
     %
-    % zh / display-date    = {2023 年 5 月},
+    zh / display-date    = {2026 年 5 月},
     %
     % 资助基金
     %
@@ -112,6 +108,7 @@
     % bib             = {References},
     % ack             = {谢\hspace{\ccwd}辞},
     % achv            = {攻读学位期间完成的论文},
+    digest            = {英文大摘要},
   },
 }
 
@@ -137,14 +134,30 @@
 \graphicspath{{figures/}}
 \DeclareGraphicsExtensions{.pdf,.eps,.png,.jpg,.jpeg}
 
+% 安全插图：图片存在时正常显示；缺失时生成占位框，避免整篇论文因缺图无法编译。
+\newcommand{\safeincludegraphics}[2][]{%
+  \IfFileExists{figures/#2}{%
+    \includegraphics[#1]{#2}%
+  }{%
+    \fbox{%
+      \parbox[c][0.24\textheight][c]{0.82\linewidth}{%
+        \centering
+        图像占位：\texttt{\detokenize{#2}}\\
+        请将正式图片文件放入 \texttt{figures/} 目录。%
+      }%
+    }%
+  }%
+}
+
 % 颜色宏包
 \usepackage{xcolor} 
 
 % 确定浮动对象的位置，可以使用 [H]，强制将浮动对象放到这里（可能效果很差）
-% \usepackage{float}
+\usepackage{float}
 
-% 固定宽度的表格
-% \usepackage{tabularx}
+% 固定宽度和自适应宽度表格
+\usepackage{array}
+\usepackage{tabularx}
 
 % 使用三线表：toprule，midrule，bottomrule。
 \usepackage{booktabs}
@@ -182,13 +195,16 @@
   upquote           = true,
   tabsize           = 2,
   showstringspaces  = false,
-  xleftmargin       = 1em,
-  xrightmargin      = 1em,
+  xleftmargin       = 0.6em,
+  xrightmargin      = 0.6em,
   breaklines        = true,
-  framexleftmargin  = 1em,
-  framexrightmargin = 1em,
+  % 避免 xmargin + framexmargin + linewidth 叠加后超出版心
+  linewidth         = \dimexpr\linewidth-1.2em\relax,
+  framexleftmargin  = 0pt,
+  framexrightmargin = 0pt,
   backgroundcolor   = \color{gray!10},
-  columns           = flexible,
+  columns           = fullflexible,
+  breakatwhitespace = false,
   keepspaces        = true,
   % texcl             = true,  % 代码中的注释部分将会被视为 LaTeX 正文模式内容
   % mathescape        = true,  % 代码中$..$的部分将会被视为 LaTeX 数学模式内容
@@ -211,7 +227,7 @@
 
 % 绘图宏包
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, shapes.geometric}
+\usetikzlibrary{arrows.meta, shapes.geometric, positioning, calc}
 
 % 数据图表宏包
 \usepackage{pgfplots}
@@ -225,6 +241,99 @@
 % 借用 ltxdoc 里面的几个命令方便写文档
 \DeclareRobustCommand\cs[1]{\texttt{\char`\\#1}}
 \providecommand\pkg[1]{{\sffamily#1}}
+
+% 行内标识符：版式上等价于 Markdown 的 `code`（等宽），但学位论文通常不用彩色底纹。
+% 断行策略：不在字母中间随意断开；仅在分隔符（. _ - = 等）之后以及小写→大写（CamelCase 边界）处允许换行，
+% 避免出现 “StreamPa…tternSubscriber” 这类难看断字。
+\ExplSyntaxOn
+\bool_new:N \l__sjtu_id_first_bool
+\tl_new:N \l__sjtu_id_prev_tl
+\bool_new:N \l__sjtu_id_delim_match_bool
+\clist_const:Nn \c__sjtu_id_delim_clist
+  { { . } { _ } { - } { = } { : } { , } { ; } { ( } { ) } { < } { > } { [ } { ] } { / } { | } }
+\prg_new_conditional:Npnn \__sjtu_id_ascii_lower:n #1 { p }
+  {
+    \int_compare:nNnTF { `#1 } < { 97 } { \prg_return_false: }
+      {
+        \int_compare:nNnTF { `#1 } > { 122 } { \prg_return_false: }
+          { \prg_return_true: }
+      }
+  }
+\prg_new_conditional:Npnn \__sjtu_id_ascii_upper:n #1 { p }
+  {
+    \int_compare:nNnTF { `#1 } < { 65 } { \prg_return_false: }
+      {
+        \int_compare:nNnTF { `#1 } > { 90 } { \prg_return_false: }
+          { \prg_return_true: }
+      }
+  }
+\cs_new_protected:Npn \__sjtu_id_delimiter_if:nTF #1#2#3
+  {
+    \bool_set_false:N \l__sjtu_id_delim_match_bool
+    \clist_map_inline:Nn \c__sjtu_id_delim_clist
+      {
+        \str_if_eq:nnT {#1} {##1}
+          {
+            \bool_set_true:N \l__sjtu_id_delim_match_bool
+            \clist_map_break:n { }
+          }
+      }
+    \bool_if:NTF \l__sjtu_id_delim_match_bool {#2} {#3}
+  }
+\cs_new_protected:Npn \__sjtu_id_maybe_break:nn #1#2
+  {
+    \__sjtu_id_delimiter_if:nTF {#1}
+      { \allowbreak }
+      {
+        \bool_lazy_and:nnTF
+          { \__sjtu_id_ascii_lower_p:n {#1} }
+          { \__sjtu_id_ascii_upper_p:n {#2} }
+          { \allowbreak }
+          { }
+      }
+  }
+\cs_new_protected:Npn \__sjtu_id_format:n #1
+  {
+    \bool_set_true:N \l__sjtu_id_first_bool
+    \tl_clear:N \l__sjtu_id_prev_tl
+    \str_map_inline:nn {#1}
+      {
+        \bool_if:NTF \l__sjtu_id_first_bool
+          {
+            ##1
+            \bool_set_false:N \l__sjtu_id_first_bool
+            \tl_set:Nn \l__sjtu_id_prev_tl {##1}
+          }
+          {
+            \exp_args:No \__sjtu_id_maybe_break:nn \l__sjtu_id_prev_tl {##1}
+            ##1
+            \tl_set:Nn \l__sjtu_id_prev_tl {##1}
+          }
+      }
+  }
+\cs_new_protected:Npn \sjtu_thesis_id:n #1
+  {
+    \texttt { \exp_args:Ne \__sjtu_id_format:n { \tl_to_str:n {#1} } }
+  }
+\NewDocumentCommand \id { m } { \sjtu_thesis_id:n {#1} }
+\ExplSyntaxOff
+
+% 原创性声明和使用授权书中的签名与日期。
+% sjtuthesis 默认只输出空白签名栏，这里根据当前论文材料补充作者和导师签名图片。
+\ExplSyntaxOn
+\cs_set_protected:Npn \__sjtu_signature:N #1
+  {
+    \parbox [ t ] { 12 em }
+      {
+        #1 签名：
+        \tl_if_eq:NNTF #1 \c__sjtu_name_decl_author_zh_tl
+          { \raisebox { -0.35 \height } { \includegraphics [ height = 0.75 cm ] { ../my_signature.png } } }
+          { \raisebox { -0.35 \height } { \includegraphics [ height = 0.75 cm ] { ../mentor_signature.jpg } } }
+        \\
+        日期：2026 年 5 月 8 日
+      }
+  }
+\ExplSyntaxOff
 
 % hyperref 宏包在最后调用
 % hidelinks：不在页面上绘制链接彩色边框（目录等处否则常显示为红框）

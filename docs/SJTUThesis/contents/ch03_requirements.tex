@@ -4,60 +4,73 @@
 
 \section{系统应用场景分析}
 
-结合开题阶段的问题界定、系统实现过程以及当前代码结构，本课题面向的并非“静态单 Topic 写入”，
-而是 Topic 集合在作业运行期间可能持续变化的场景。例如：多租户系统按租户自动建 Topic，
-业务按日期、地域或业务线拆分 Topic，或在灰度迁移、容灾切换时，新旧 Topic 与新旧集群并存。
-这些场景的共同特点是：上游 Flink 作业需要长期运行，而下游 Kafka 拓扑并不稳定。
+在实时数据平台中，Flink 作业通常承担持续运行的计算与写出职责，而 Kafka Topic 则经常随着业务边界变化而调整。
+例如，多租户系统可能按租户自动创建 Topic，日志平台可能按日期、地域或业务线拆分 Topic，
+灰度迁移和容灾切换场景中也可能同时存在新旧 Topic 或新旧集群。若仍采用传统静态 Sink，
+作业在提交时就把目标 Topic 与连接参数固定下来，一旦下游目标变化，就需要停止作业、修改配置并重新部署。
+这一过程会引入运维窗口、恢复等待时间和潜在重复写入风险，与实时链路“持续写入、低人工介入、快速接纳新目标”的要求相矛盾。
 
-在本项目中，connector 通过 \texttt{stream\_pattern}、\texttt{route\_map}、
-\texttt{stream-metadata-discovery-interval-ms} 等参数暴露动态能力，而应用层只负责把这些参数装配进运行中的 Flink 作业。
+因此，本文面对的核心问题不是“如何把数据写入一个 Kafka Topic”，而是“当可写 Topic 集合在运行期间变化时，
+Flink Sink 如何在不重启作业的前提下发现变化、更新写入目标，并保持状态与提交路径可恢复”。
+这一问题天然包含两个层次：第一，系统需要从 Kafka 集群元数据中识别符合规则的新 Topic；
+第二，系统需要把业务侧的逻辑路由与实际物理 Topic 解耦，使业务记录不必直接绑定某个固定目标。
+前者对应自动发现路径，后者对应显式逻辑 route 路径。
+
+在本项目中，connector 通过 Topic 匹配模式、route 映射和元数据发现间隔等参数暴露动态能力，
+而应用层只负责把这些参数装配进运行中的 Flink 作业。
 因此，系统不仅要支持“自动发现符合模式的 Topic”，还要支持“根据业务 route id 动态决定消息应写往哪一类 Topic”。
 这意味着问题已从“静态写一个 Topic”扩展为“运行期维护逻辑路由、物理 Topic 与底层 KafkaWriter 的关系”。
 
 与抽象需求相对应，当前仓库中的配置已经给出了较为完整的输入形式，本文将其整理至附录~\ref{appendix:configs}。
-从这些配置可以看出，该 connector 同时暴露了自动发现所需的 \texttt{stream\_pattern} 与
-\texttt{discovery\_interval\_ms}，以及显式路由所需的 \texttt{route\_map}。这意味着本文讨论的并不是
+从这些配置可以看出，该 connector 同时暴露了自动发现所需的 \id{stream_pattern} 与
+\id{discovery_interval_ms}，以及显式路由所需的 \id{route_map}。这意味着本文讨论的并不是
 单一路径下的动态写入，而是“自动发现路径”和“逻辑 route 路径”并存的复合场景。
 
 \section{功能需求分析}
 
+由上述场景可知，静态 Sink 的不足并不只是一项配置不够灵活，而是会沿着“目标发现、目标选择、写入通道、状态恢复”
+形成连续影响：如果系统无法发现新 Topic，就不能减少停机变更；如果无法把逻辑 route 映射到物理 Topic，
+业务记录仍会被固定目标约束；如果发现目标后不能自动维护 writer，数据仍无法真正写出；如果 route 状态不能进入
+Checkpoint，故障恢复后又会丢失运行期动态信息。因此，本节将功能需求拆分为动态 Topic 发现、自动订阅、
+动态路由和数据处理四类，它们分别对应前述问题链条中的不同环节，并共同支撑后续第 4 章的系统设计。
+
 \subsection{动态 Topic 发现需求}
 
 系统应能根据用户配置的 Topic 名称模式，周期性查询 Kafka 当前 Topic 列表，并识别所有符合规则的目标。
-当前实现中，\texttt{DynamicKafkaSinkBuilder.setStreamPattern(...)} 接收 \texttt{Pattern}，
-\texttt{StreamPatternSubscriber.getSubscribedStreams(...)} 再调用 \texttt{KafkaMetadataService.getAllStreams()}
-完成匹配；在单集群实现 \texttt{SingleClusterTopicMetadataService} 中，\texttt{streamId} 直接等价于 Topic 名称，
+当前实现中，\id{DynamicKafkaSinkBuilder.setStreamPattern(...)} 接收 \id{Pattern}，
+\id{StreamPatternSubscriber.getSubscribedStreams(...)} 再调用 \id{KafkaMetadataService.getAllStreams()}
+完成匹配；在单集群实现 \id{SingleClusterTopicMetadataService} 中，\id{streamId} 直接等价于 Topic 名称，
 因此模式匹配实质上就是对集群 Topic 名称做运行期过滤。
 
 \subsection{自动订阅需求}
 
 Sink 侧的“订阅”不是消费者组意义上的分区订阅，而是指 Writer 对“当前可写目标集合”的维护。
-在代码中，这一集合由 \texttt{DynamicKafkaSinkWriter} 的 \texttt{activeRouteIds} 表示；
-当 \texttt{refreshRouteIfNeeded(...)} 触发刷新时，Writer 通过 \texttt{resolveRoutes()} 获取新的可写 route 集合，
-再按 route id 检查是否需要创建新的 \texttt{ClusterWriter}。因此，本系统必须支持以下功能：
+在代码中，这一集合由 \id{DynamicKafkaSinkWriter} 的 \id{activeRouteIds} 表示；
+当 \id{refreshRouteIfNeeded(...)} 触发刷新时，Writer 通过 \id{resolveRoutes()} 获取新的可写 route 集合，
+再按 route id 检查是否需要创建新的 \id{ClusterWriter}。因此，本系统必须支持以下功能：
 一是首次启动时根据元数据建立可写集合；二是在运行期发现新增 route 时自动扩展写入路径；
-三是在后续优化中补充 route 回收策略，避免长时间累积陈旧 writer。
+三是在 route 不再被活动集合或显式逻辑 route 引用时，尽可能释放对应 writer，避免长时间累积陈旧资源。
 
-需要指出的是，当前代码已经支持 route 的新增与切换，但对“已失效 route 的 writer 回收”尚未完全实现。
-也就是说，\texttt{clusterWritersByRouteId} 会通过 \texttt{computeIfAbsent(...)} 追加新 writer，
-但不会在 route 失活后立即删除对应 writer。这一点与开题报告中的理想目标之间仍有差距，
-后文将把它作为工程化完善方向加以讨论。
+需要指出的是，当前代码已经支持 route 的新增与切换，并在 \id{DeliveryGuarantee.NONE} 和
+\id{AT_LEAST_ONCE} 路径下补充了退役 writer 清理；但在 \id{EXACTLY_ONCE} 路径下，
+由于事务上下文可能跨 Checkpoint 存在，当前实现仍采用保守策略，不自动清理退役 writer。
+因此，自动订阅需求在本文原型中已经形成基本闭环，但事务路径下的安全回收仍属于后续工程化完善方向。
 
 \subsection{动态路由需求}
 
 系统应支持“逻辑 route id $\to$ 物理 Kafka 目标”的两级映射，而不是把业务记录直接绑定到固定 Topic。
-在应用层，\texttt{DynamicSinkEvent} 同时实现了数据记录与路由更新事件两种语义：
-普通数据事件携带 \texttt{routeId} 与消息内容，更新事件通过 \texttt{getRouteUpdates()} 下发
-\texttt{Map<String, KafkaRouteDestination>}。在运行时，\texttt{DynamicKafkaSinkWriter.write(...)} 会先判断输入事件
-是否为 \texttt{DynamicKafkaRouteEvent}，若是更新事件则调用 \texttt{applyRouteUpdates(...)} 更新 \texttt{explicitRoutesById}；
-若是普通事件且显式指定了 \texttt{routeId}，则调用 \texttt{writeToExplicitRoute(...)} 走逻辑路由路径。
+在应用层，\id{DynamicSinkEvent} 同时实现了数据记录与路由更新事件两种语义：
+普通数据事件携带 \id{routeId} 与消息内容，更新事件通过 \id{getRouteUpdates()} 下发
+\id{Map<String, KafkaRouteDestination>}。在运行时，\id{DynamicKafkaSinkWriter.write(...)} 会先判断输入事件
+是否为 \id{DynamicKafkaRouteEvent}，若是更新事件则调用 \id{applyRouteUpdates(...)} 更新 \id{explicitRoutesById}；
+若是普通事件且显式指定了 \id{routeId}，则调用 \id{writeToExplicitRoute(...)} 走逻辑路由路径。
 
 这说明本系统的路由需求具有两个层面：其一，面向“自动发现”的通用 route；其二，面向“显式 route id”
 的逻辑路由。后者正是本文“逻辑路由与物理路由分离”设计思想的直接代码体现。
 
 进一步地，当前原型并没有把 route 配置静态地塞进 Sink，而是通过一个轻量级验证载体利用广播状态与控制事件把 route 更新传播到运行中的算子实例。
 代码清单~\ref{code:route-broadcast} 展示了这一机制的关键处理逻辑：普通数据事件只有在广播状态中存在对应
-\texttt{routeId} 时才会被放行，而 route 更新事件则会先改写广播状态，再继续向下游 Sink 传播。需要强调的是，
+\id{routeId} 时才会被放行，而 route 更新事件则会先改写广播状态，再继续向下游 Sink 传播。需要强调的是，
 这一部分并非 connector 的核心交付物，而是为了验证 connector 的显式 route 更新接口而构造的上层驱动。
 
 \begin{codeblock}[language=Java,caption={应用层通过广播状态维护 route 配置并向下游传播控制事件},label={code:route-broadcast}]
@@ -99,48 +112,125 @@ public void processBroadcastElement(
 
 系统应能在持续数据流上稳定完成以下处理链路：数据生成/采集、route 校验、路由解析、Topic 选择、
 消息序列化、Kafka 写入、Checkpoint 快照与故障恢复。当前验证载体使用
-\texttt{DataGeneratorSource} 生成测试数据，并通过 \texttt{BroadcastProcessFunction} 先过滤掉不存在的 route id，
+\id{DataGeneratorSource} 生成测试数据，并通过 \id{BroadcastProcessFunction} 先过滤掉不存在的 route id，
 再将合规事件送入动态 Sink。说明系统在验证层面已经具备“数据面”和“控制面”混合流的基本处理能力，
 而 connector 本身则只关心进入 Writer 之后的解析、写入与状态管理。
 
-从实现要求看，序列化层还必须适应动态 Topic 绑定。当前 \texttt{DynamicKafkaSinkWriter.createClusterWriter(...)}
-会为每个 route 克隆一份 \texttt{KafkaRecordSerializationSchema}，并用内部类
-\texttt{FixedTopicKafkaRecordSerializationSchema} 覆写最终发送的 Topic。若用户 serializer 实现了
-\texttt{DynamicKafkaTargetAwareRecordSerializationSchema}，则可以直接拿到解析后的目标 Topic；
+从实现要求看，序列化层还必须适应动态 Topic 绑定。当前 \id{DynamicKafkaSinkWriter.createClusterWriter(...)}
+会为每个 route 克隆一份 \id{KafkaRecordSerializationSchema}，并用内部类
+\id{FixedTopicKafkaRecordSerializationSchema} 覆写最终发送的 Topic。若用户 serializer 实现了
+\id{DynamicKafkaTargetAwareRecordSerializationSchema}，则可以直接拿到解析后的目标 Topic；
 否则框架会保留原有 key/value/headers，只强制改写 Topic 字段。这一机制是当前原型可运行的关键约束之一。
 
 \section{非功能需求分析}
 
+为了避免非功能需求停留在定性描述，本文将其限定为当前原型能够在本地实验中验证的指标。
+这些指标不是生产级服务等级协议，而是用于判断本文方案是否满足毕业设计原型目标的可测约束。
+各项指标的取值依据来自三类因素：其一是第 3.1 节场景分析给出的业务约束，即实时链路希望在不重启作业的情况下
+快速接纳新增 Topic，且动态能力不能显著破坏持续写入能力；其二是当前实现的机制上界，例如
+\id{discovery_interval_ms=2000} 决定了新增 Topic 通常需要等待下一轮刷新后才能被发现；
+其三是本地单机原型的实验边界，例如第 5 章采用 \id{parallelism=1}、小规模 route 数量和约 30 秒运行窗口进行验证。
+因此，本节中的数值不是孤立给出的，而是由“场景诉求—实现机制—实验条件”共同推导得到。
+
+\subsection{非功能指标的推导}
+
+首先，发现实时性指标来源于“业务目标变化后不应再以停机重启为主要生效方式”的场景诉求。
+在传统静态 Sink 中，新增 Topic 往往需要修改配置并重新提交作业，生效时间通常以人工操作和作业恢复时间计。
+本文原型的目标不是把发现延迟压到毫秒级，而是证明在默认轮询机制下，Topic 变化可以在一个很短的自动化窗口内被接纳。
+由于实验配置采用 \id{discovery_interval_ms=2000}，理论上新增 Topic 最坏会等待接近一个刷新周期；
+再考虑 Kafka 管理面查询、Writer 创建和本地任务调度开销，本文额外预留约 \id{1 s}，
+因此将“首次写入不超过 \id{3 s}”作为发现实时性目标。该阈值既来自当前实现的刷新周期，又明显小于停机重启的运维窗口，
+能够体现动态发现机制的实际价值。
+
+其次，吞吐可接受性和小规模扩展性指标来源于“动态能力不应以明显牺牲稳定写入能力为代价”的场景诉求。
+本文方案相比静态 KafkaSink 增加了 route 查找、正则匹配结果缓存、多 writer 管理和提交对象包装，
+因此完全没有开销并不现实；但在本地单机、2-route 到 4-route 的原型规模下，这些逻辑应当只是附加管理成本，
+不应成为主要吞吐瓶颈。基于这一判断，本文将动态 2-route 相对静态基线的吞吐下降阈值设为 5\%，
+用来判断动态管理层是否仍处于可接受开销范围；将 2-route 增至 4-route 的下降阈值设为 10\%，
+用来观察小规模 route 扩展是否立即导致写入路径退化。若超过这些阈值，则说明 route 管理、writer 创建或提交包装已经对原型目标产生明显影响，
+需要在设计层面重新考虑缓存、批量刷新和 writer 复用策略。
+
+再次，Checkpoint 协同指标来源于“动态 route 状态必须进入 Flink 原生容错链路”的场景诉求。
+本文并不要求本地原型达到生产集群的大规模容错性能，但要求 route 级状态快照不能明显阻塞小规模作业。
+在实验中 Checkpoint 间隔设置为 \id{5000 ms}，因此稳态单次 Checkpoint 若达到数百毫秒甚至秒级，
+就会说明动态状态封装已经对正常流处理产生可见干扰。本文将稳态完成时延阈值设为 \id{100 ms}，
+是为了保证快照耗时相对 5 秒间隔保持在较低比例内，并便于通过第 5 章日志直接观察。
+
+最后，事务路径可运行性指标来源于“动态 Sink 不能只在 \id{AT_LEAST_ONCE} 下成立”的场景诉求。
+完整精准一次语义需要故障注入、恢复验证和下游 \id{read_committed} 消费检查共同支撑，
+这超出了本文本地原型实验的覆盖范围。因此本文没有把该指标定义为生产级端到端精准一次证明，
+而是定义为更保守的可运行性目标：\id{EXACTLY_ONCE} 小规模运行中至少完成 5 次 Checkpoint，
+并在两个目标 Topic 上观察到 committed 输出。这个指标用于证明 route 级事务前缀、committable 包装和 committer 分发链路能够跑通，
+为后续更严格故障验证奠定基础。表~\ref{tab:nfr-targets} 汇总了上述量化指标及其验证位置。
+
+\begin{table}[htbp]
+  \centering
+  \caption{本文原型的非功能需求指标}
+  \label{tab:nfr-targets}
+  \begin{tabular}{p{0.18\textwidth}p{0.34\textwidth}p{0.38\textwidth}}
+    \toprule
+    需求类型 & 量化指标 & 指标依据与验证方式 \\
+    \midrule
+    发现实时性 & 在 \id{discovery_interval_ms=2000} 条件下，新增匹配 Topic 的首次写入延迟应不超过 \id{3 s}。 &
+    理论上延迟主要由下一轮刷新等待时间、\id{AdminClient.listTopics()} 调用和任务调度组成；第 5 章通过发现实时性实验验证。 \\
+    吞吐可接受性 & 在本地单机、\id{AT_LEAST_ONCE}、2-route 显式路由场景下，动态方案吞吐较静态基线下降不超过 5\%。 &
+    动态 Sink 增加 route 解析和 writer 查找，但不应在小规模 route 下成为主导瓶颈；第 5 章静态基线对照实验验证。 \\
+    小规模扩展性 & 在相同本地环境下，route 数量由 2 增至 4 时，吞吐不应出现超过 10\% 的下降。 &
+    该指标用于验证小规模多 route 管理不会立刻压垮写入路径；第 5 章吞吐测试表进行验证。 \\
+    Checkpoint 协同 & 打开间隔为 \id{5000 ms} 的 Checkpoint 后，作业应能连续完成 Checkpoint，稳态完成时延控制在 \id{100 ms} 以内。 &
+    route 级状态快照不应明显阻塞本地小规模作业；第 5 章 Checkpoint 时延实验验证。 \\
+    事务路径可运行性 & \id{EXACTLY_ONCE} 小规模运行中应完成至少 5 次 Checkpoint，并在两个目标 Topic 均产生 committed 输出。 &
+    该指标验证 route 级事务提交链路可运行，但不等同于复杂故障注入下的完整精准一次证明；第 5 章 Exactly-once 验证对应。 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
 \subsection{实时性要求}
 
 实时性的核心不是单条消息发送延迟，而是“Topic 变化被发现并投入写入”的时间上界。
-当前代码通过配置项 \texttt{stream-metadata-discovery-interval-ms} 控制元数据刷新周期；
-在 \texttt{DynamicKafkaSinkOptions} 中其默认值为 \texttt{-1}，表示非正值时关闭自动发现，
-而在应用层 \texttt{KafkaSinkBuilder} 中会把 \texttt{dynamic.discovery\_interval\_ms} 传入该参数，
-示例配置默认是 \texttt{2000 ms}。因此，系统的最小发现粒度大致受该周期限制，
-再叠加 \texttt{AdminClient.listTopics()} 返回时间与作业线程调度延迟，形成端到端发现时延。
+当前代码通过配置项 \id{stream-metadata-discovery-interval-ms} 控制元数据刷新周期；
+在 \id{DynamicKafkaSinkOptions} 中其默认值为 \id{-1}，表示非正值时关闭自动发现，
+应用层构建 Sink 时会把动态发现间隔配置传入该参数，
+示例配置默认是 \id{2000 ms}。因此，系统的最小发现粒度大致受该周期限制，
+再叠加 \id{AdminClient.listTopics()} 返回时间与作业线程调度延迟，形成端到端发现时延。
+基于这一机制，本文将本地原型的实时性目标定义为：默认 \id{2000 ms} 刷新周期下，
+新增匹配 Topic 从创建成功到首次出现写入的时间不超过 \id{3 s}。该阈值比配置周期多预留约 \id{1 s}
+给 Kafka 管理面调用与本地任务调度，既符合当前轮询实现的理论上界，也能在第 5 章通过 offset 观测直接验证。
 
 \subsection{可扩展性要求}
 
-可扩展性主要体现在三个方面。首先，随着匹配 Topic 数量增加，\texttt{clusterWritersByRouteId} 中维护的
-底层 \texttt{KafkaSink} writer 数量同步增加，Kafka 连接、事务上下文和缓存占用也会提高。其次，
-\texttt{resolveRoutes()} 会对所有已订阅 stream 和其 cluster metadata 做展开，因此当 Topic 与 cluster 数量扩大时，
+可扩展性主要体现在三个方面。首先，随着匹配 Topic 数量增加，\id{clusterWritersByRouteId} 中维护的
+底层 \id{KafkaSink} writer 数量同步增加，Kafka 连接、事务上下文和缓存占用也会提高。其次，
+\id{resolveRoutes()} 会对所有已订阅 stream 和其 cluster metadata 做展开，因此当 Topic 与 cluster 数量扩大时，
 刷新计算本身会带来额外成本。再次，route id 的设计目前采用
-\texttt{clusterId|topic|bootstrapServers} 或 \texttt{logicalRouteId|clusterId|topic|bootstrapServers} 形式拼接，
+\id{clusterId|topic|bootstrapServers} 或 \id{logicalRouteId|clusterId|topic|bootstrapServers} 形式拼接，
 虽然实现简单、可唯一标识物理目标，但在大规模场景下需要更系统的命名与管理策略。
+
+考虑到本文实验环境是本地单机原型，而非生产集群压测，本文把可扩展性指标限定在小规模 route 扩展是否引入明显退化：
+一是在 2-route 显式路由场景下，动态方案较静态基线吞吐下降不超过 5\%；
+二是在相同条件下将 route 数量从 2 增加到 4 时，吞吐下降不超过 10\%。
+这两个阈值的合理性在于：动态 Sink 相比静态 Sink 必然增加 route 查找、writer 管理和提交包装开销，
+但在毕业设计原型所覆盖的小规模场景中，这些开销不应主导整体吞吐；若下降超过上述范围，
+则说明动态管理逻辑已经成为主要瓶颈，需要在设计阶段重新考虑缓存、批量刷新或 writer 复用策略。
 
 \subsection{稳定性与容错性要求}
 
 动态写入系统不能只关注“能否写出去”，还必须保证故障后状态可恢复。当前实现中，
-\texttt{DynamicKafkaSink} 继承 \texttt{TwoPhaseCommittingStatefulSink}，Writer 在 \texttt{snapshotState(...)} 中输出
-\texttt{DynamicKafkaSinkWriterState}，其中包含 \texttt{routeId}、\texttt{kafkaClusterId}、\texttt{topic}、
-\texttt{transactionalIdPrefix}、\texttt{kafkaProducerConfig} 以及底层 \texttt{KafkaWriterState} 列表；
-提交阶段则通过 \texttt{prepareCommit()} 生成 \texttt{DynamicKafkaCommittable}，交由 \texttt{DynamicKafkaCommitter}
-按 route 分发给底层 \texttt{KafkaCommitter}。因此，系统至少需要满足：快照内容足以重建 route 级 writer，
+\id{DynamicKafkaSink} 继承 \id{TwoPhaseCommittingStatefulSink}，Writer 在 \id{snapshotState(...)} 中输出
+\id{DynamicKafkaSinkWriterState}，其中包含 \id{routeId}、\id{kafkaClusterId}、\id{topic}、
+\id{transactionalIdPrefix}、\id{kafkaProducerConfig} 以及底层 \id{KafkaWriterState} 列表；
+提交阶段则通过 \id{prepareCommit()} 生成 \id{DynamicKafkaCommittable}，交由 \id{DynamicKafkaCommitter}
+按 route 分发给底层 \id{KafkaCommitter}。因此，系统至少需要满足：快照内容足以重建 route 级 writer，
 恢复后能够重新拉起 writer 并继续工作，提交路径能够按 route 维度保持隔离。
 
-与此同时，日志、监控指标、异常处理与陈旧 writer 清理等工程能力，
-在当前代码中仍然不足，这是进一步增强稳定性的重点。
+本文对稳定性与容错性的原型级量化要求包括两项。第一，在开启间隔为 \id{5000 ms} 的 Checkpoint 后，
+作业应能够连续完成 Checkpoint，且排除首次冷启动影响后的稳态 Checkpoint 完成时延应控制在 \id{100 ms} 以内；
+该指标用于判断 route 级状态封装是否给本地小规模作业引入明显阻塞。第二，在
+\id{EXACTLY_ONCE} 小规模验证中，系统应至少完成 5 次 Checkpoint，并在两个目标 Topic 上观察到 committed 输出；
+该指标用于证明 route 级事务提交路径能够跑通。需要强调的是，后者并不等同于覆盖网络中断、TaskManager 崩溃、
+事务超时等复杂故障的完整精准一次证明，而是本文原型阶段可验证的最低一致性闭环。
+与此同时，日志、监控指标、异常处理与 \id{EXACTLY_ONCE} 路径下退役 writer 的安全清理等工程能力，
+仍是进一步增强稳定性的重点。
 
 \section{问题建模与分析}
 
@@ -148,16 +238,19 @@ public void processBroadcastElement(
 $S(t)=\{\tau\in T(t)\mid \tau\ \text{匹配}\ P\}$。对于显式路由模式，系统还维护逻辑 route 集合
 $R=\{r_1,r_2,\dots,r_n\}$ 以及映射函数
 $g:R\rightarrow 2^{S(t)}$，表示一个逻辑 route id 在时刻 $t$ 可以映射到的物理 Topic 集合。
-对任意输入记录 $e$，若其未显式指定 route id，则走自动发现路径并广播写入当前 \texttt{activeRouteIds}；
+对任意输入记录 $e$，若其未显式指定 route id，则走自动发现路径并广播写入当前 \id{activeRouteIds}；
 若其显式指定逻辑 route id，则写入集合由 $g(r,t)$ 决定。
 
 当前原型的一个重要实现特征是“自动发现路径”和“显式逻辑路由路径”并存：
-前者由 \texttt{resolveRoutes()} 基于订阅的 \texttt{KafkaStream} 自动展开，后者由 \texttt{resolveExplicitRoutes(...)}
-基于 \texttt{KafkaRouteDestination} 的 \texttt{bootstrapServers} 与 \texttt{topicPattern} 解析得到。
+前者由 \id{resolveRoutes()} 基于订阅的 \id{KafkaStream} 自动展开，后者由 \id{resolveExplicitRoutes(...)}
+基于 \id{KafkaRouteDestination} 的 \id{bootstrapServers} 与 \id{topicPattern} 解析得到。
 因此，系统本质上是在同一 Writer 内维护两类 route 解析逻辑，并保证两者都能落入统一的快照与提交框架中。
 
 \section{本章小结}
 
-本章在前文问题分析基础上，结合当前代码实现对系统需求进行了更细化的刻画：
-不仅明确了动态 Topic 发现、逻辑路由更新与状态恢复等功能目标，也指出了当前实现已经达到的能力边界，
-例如 route 扩展已实现而 route 回收尚待完善。这些分析为下一章的设计与实现说明提供了直接依据。
+本章从实时链路长期运行与 Kafka Topic 动态变化之间的矛盾出发，独立推导了本文系统需要解决的问题：
+既要在运行期发现符合规则的新 Topic，也要将业务逻辑 route 与物理 Topic 解耦，并让 writer、状态和提交路径跟随 route
+变化而调整。随后，本章将这些问题拆解为动态 Topic 发现、自动订阅、动态路由和数据处理四类功能需求，
+并进一步给出发现实时性、吞吐可接受性、小规模扩展性、Checkpoint 协同和事务路径可运行性等量化非功能指标。
+这些指标将在第 4 章的设计中分别对应到元数据刷新、route 解析、writer 管理、状态快照和提交器设计，
+并在第 5 章通过发现实时性、吞吐可接受性、小规模扩展性、Checkpoint 协同与事务路径可运行性实验进行验证，从而形成需求、设计与实验之间的闭环。

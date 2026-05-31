@@ -18,6 +18,7 @@
 \input{setup}
 
 \begin{document}
+\setlength{\baselineskip}{20pt}
 
 %TC:ignore
 
@@ -32,12 +33,24 @@
 
 % 前置部分
 \frontmatter
+{
+\fancyhead[LE,RO]{}
 
 % 摘要
+\ctexset{chapter={afterskip=26bp}}
 \input{contents/abstract}
 
+{
+\ctexset{chapter={afterskip=26bp}}
+\makeatletter
+\@ifundefined{cftchapfont}{}{\renewcommand{\cftchapfont}{\zihao{4}\bfseries}}
+\@ifundefined{cftsecfont}{}{\renewcommand{\cftsecfont}{\zihao{-4}}}
+\@ifundefined{cftsubsecfont}{}{\renewcommand{\cftsubsecfont}{\zihao{5}}}
+\makeatother
 % 目录
 \tableofcontents
+}
+}
 % 以下前置索引暂时不输出（contents/nomenclature.tex 等文件保留，需要时取消注释）
 % 插图索引
 % \listoffigures
@@ -54,21 +67,43 @@
 \mainmatter
 
 % 正文内容
+{
+\ctexset{chapter={afterskip=26bp}}
 \input{contents/intro}
 \input{contents/ch02_related}
 \input{contents/ch03_requirements}
 \input{contents/ch04_design}
 \input{contents/ch05_experiment}
 \input{contents/summary}
+}
 
 %TC:ignore
 
 % 参考文献
 \clearpage
 {
+\fancyhead[R]{参考文献}
 \ctexset{chapter={afterskip=26bp}}
+\renewcommand{\bibfont}{\zihao{5}}
+\setbaselineskip{15.6bp}
 \printbibliography[heading=bibintoc]
 }
+
+\makeatletter
+% \appendix 采用数字编号；附录章标题使用 \appchapter，避免重复写入目录。
+\renewcommand{\appendix}{\par
+    \setcounter{chapter}{0}
+    \setcounter{section}{0}
+    \ctexset{chapter/number={\arabic{chapter}}}
+    \renewcommand{\theHchapter}{appendix.\arabic{chapter}}
+    \renewcommand{\theHsection}{appendix.\arabic{chapter}.\arabic{section}}
+}
+\newcommand{\appchapter}[1]{
+    \refstepcounter{chapter}
+    \chapter*{#1（附录 \thechapter）}
+    \markboth{附录 \thechapter}{附录 \thechapter}
+}
+\makeatother
 
 % 附录
 \clearpage
@@ -88,8 +123,15 @@
 
 % 用于盲审的论文需隐去致谢、发表论文、科研成果、简历
 
+% 发表论文及科研成果
+{\clearpage
+\ctexset{chapter={afterskip=26bp}}
+\input{contents/achievements}
+}
+
 % 致谢
 {\clearpage
+\fancyhead[R]{致谢}
 \ctexset{chapter={afterskip=26bp}}
 \input{contents/acknowledgements}
 }
@@ -98,6 +140,12 @@
 {\clearpage
 \ctexset{chapter={afterskip=26bp}}
 \input{contents/digest}
+}
+
+% 人工智能工具使用说明
+{\clearpage
+\ctexset{chapter={afterskip=26bp}}
+\input{contents/ai_usage}
 }
 
 %TC:endignore

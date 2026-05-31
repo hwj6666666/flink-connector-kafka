@@ -1,6 +1,7 @@
 % !TEX root = ../main.tex
 
-\chapter{附录}
+\appchapter{实验配置与复现命令}\label{appendix:experiments}
+\addcontentsline{toc}{chapter}{附\quad 录}
 
 \section{实验配置样例}
 \label{appendix:configs}
@@ -36,17 +37,17 @@ regular:
   parallelism: 1
 \end{codeblock}
 
-\subsection{自动发现延迟实验配置}
+\subsection{发现实时性实验配置}
 
-自动发现延迟实验没有依赖显式 route map，而是使用 \texttt{AutoDiscoveryJob}
-生成不携带 \texttt{routeId} 的数据记录，并通过 \texttt{stream\_pattern} 驱动
-\texttt{DynamicKafkaSinkWriter.refreshRouteIfNeeded(...)} 进行 route 刷新。对应命令中使用的关键参数为：
-\texttt{bootstrap-servers=localhost:9092}、
-\texttt{cluster-id=default-cluster}、
+发现实时性实验没有依赖显式 route map，而是使用 \id{AutoDiscoveryJob}
+生成不携带 \id{routeId} 的数据记录，并通过 \id{stream_pattern} 驱动
+\id{DynamicKafkaSinkWriter.refreshRouteIfNeeded(...)} 进行 route 刷新。对应命令中使用的关键参数为：
+\id{bootstrap-servers=localhost:9092}、
+\id{cluster-id=default-cluster}、
 \texttt{stream-pattern=\^{}exp-auto-.*\$}、
-\texttt{emit-interval-ms=50}、
-\texttt{parallelism=1}、
-\texttt{discovery-interval-ms=2000}。
+\id{emit-interval-ms=50}、
+\id{parallelism=1}、
+\id{discovery-interval-ms=2000}。
 
 \section{复现实验命令}
 \label{appendix:commands}
@@ -64,7 +65,7 @@ regular:
 ./run.sh run regular
 \end{codeblock}
 
-\begin{codeblock}[language=bash,caption={自动发现延迟实验的核心执行命令示意}]
+\begin{codeblock}[language=bash,caption={发现实时性实验的核心执行命令示意}]
 java -cp app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar \
   org.apache.flink.dynamic.sink.job.AutoDiscoveryJob \
   --bootstrap-servers localhost:9092 \
@@ -75,7 +76,7 @@ java -cp app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar \
   --discovery-interval-ms 2000
 \end{codeblock}
 
-\begin{codeblock}[language=bash,caption={Checkpoint 与 Exactly-once 小规模验证命令示意}]
+\begin{codeblock}[language=bash,caption={Checkpoint 协同与事务路径可运行性验证命令示意}]
 java -cp app/target/dynamic-kafka-sink-app-1.0-SNAPSHOT.jar \
   org.apache.flink.dynamic.sink.job.DynamicJob \
   --bootstrap-servers localhost:9092 \

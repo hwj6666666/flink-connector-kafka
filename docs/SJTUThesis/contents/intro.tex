@@ -24,7 +24,7 @@ bootstrap servers、序列化器与投递语义，后续运行期间若底层目
 
 \begin{figure}[htbp]
   \centering
-  \includegraphics[width=0.92\textwidth]{offline_vs_regex_routing.png}
+  \safeincludegraphics[width=0.92\textwidth]{offline_vs_regex_routing.png}
   \caption{传统离线更新方式与基于正则的动态路由方式对比}
   \label{fig:intro-offline-vs-regex}
 \end{figure}
@@ -61,40 +61,88 @@ bootstrap servers、序列化器与投递语义，后续运行期间若底层目
 
 \section{国内外研究现状}
 
-\subsection{Kafka 消费模式研究现状}
+\subsection{Kafka 与消息系统相关研究}
 
-Kafka 通过 Topic、分区与消费者组等机制支撑高吞吐的消息发布与订阅\cite{kreps2011kafka}。
-围绕 Kafka 自身的性能与运维，已有工作利用混合优化算法等对分布式消息系统配置进行自动化调优\cite{ma2025dmga}，
-并从分区策略、性能建模等角度改善集群负载与可观测性\cite{wang2022astraea,wu2021logp}。
-这些研究为上层流处理连接器提供了可靠的存储与传输基础，
-但多聚焦于 Kafka 作为独立系统的优化，对“上层计算框架如何在运行期感知并跟随 Topic 变化”
-的耦合问题涉及相对较少。消费端语义（如组协调、分区分配）与 Sink 端生产写入在模型上并不相同，
-但二者共同依赖对集群元数据的理解与访问方式，相关成果对元数据获取、元数据刷新周期与客户端管理策略仍有借鉴意义。
-从这个角度看，Kafka 研究为本文提供的是“动态写入目标问题”的基础设施背景，而不是直接现成的解决方案。
+Kafka 通过 Topic、分区、副本与消费者组等机制支撑高吞吐消息发布订阅\cite{kreps2011kafka}。
+围绕 Kafka 自身的性能与运维，已有研究从配置优化、分区策略、性能建模与负载均衡等角度改进消息系统能力：
+例如，DMGA-PSO 等方法尝试对分布式消息系统配置进行自动化调优\cite{ma2025dmga}，
+Astraea Partitioner 关注基于历史负载信息的 Kafka 集群节点动态负载平衡\cite{wang2022astraea}，
+LogP 性能模型相关工作则从通信模型角度刻画 Kafka 性能特征\cite{wu2021logp}。
+这些研究的共同贡献在于提升 Kafka 作为消息基础设施的吞吐、负载均衡与可观测性，
+为上层实时计算提供了稳定的数据通道。
 
-\subsection{Flink 流处理技术发展现状}
+然而，上述工作主要把 Kafka 作为独立消息系统进行优化，其核心对象是 broker、分区或客户端负载，
+并不直接解决“Flink 作业运行期间目标 Topic 集合发生变化时，Sink 侧如何自动发现并调整写入路径”的问题。
+Kafka 本身提供了元数据访问、生产者事务和可提交读等底层能力，但这些能力只是动态 Sink 的构建材料；
+如何在流处理连接器中把元数据刷新、生产者生命周期、route 绑定、状态恢复与提交语义组织成完整机制，
+仍需要在 Flink 连接器层面进一步设计。因此，Kafka 相关研究说明了本文问题的基础设施背景，
+但尚未给出面向 Flink Sink 侧动态写入的直接方案。
 
-Flink 在统一流批引擎、有状态计算与容错方面已形成较为完整的体系\cite{carbone2015flink}。
-学术与工业界针对流处理系统的弹性、调度与能耗等主题持续开展研究，例如面向有状态流处理系统的
-细粒度可扩展性\cite{qiu2025finegrained}、面向 Flink 流应用的能效感知调度与两层协调负载均衡\cite{li2025flinkenergy}等。
-这些工作主要改善算子并行度、资源与状态迁移，对“与外部消息系统连接器的动态适配”讨论相对有限。
-工业界亦有大规模流处理系统实践，如早期 Twitter 上的 Storm\cite{toshniwal2014storm}、
-LinkedIn 上有状态的 Samza\cite{noghabi2017samza}等，为流式管道工程化提供参照。
-教程与综述性工作亦系统介绍了 Flink 的流分析能力\cite{katsifodimos2016flinktutorial}。
-就工程集成而言，官方文档说明了 Flink 与 Kafka 的集成及统一 Sink API 的写入方式\cite{flinkKafkaDocs,flinkUnifiedSink}，
-为扩展动态写入路径提供了实现基础。可以说，Flink 本身已经具备支持动态行为所需的运行时框架，
-关键问题在于如何在连接器层面合理组织这些能力，使其既能适应变化又不破坏现有提交与恢复语义。
+\subsection{Flink 流处理与连接器研究}
 
-\subsection{动态数据订阅机制相关研究}
+Flink 已在统一流批处理、有状态计算和 Checkpoint 容错方面形成较完整体系\cite{carbone2015flink}。
+围绕流处理系统，学术与工业界持续研究弹性伸缩、调度优化、状态迁移和能耗控制等问题：
+例如，细粒度可扩展性研究关注有状态流处理系统如何更平滑地调整资源\cite{qiu2025finegrained}，
+面向 Flink 的能效感知调度与两层协调负载均衡研究则从资源效率角度改进流式作业运行\cite{li2025flinkenergy}。
+Twitter Storm\cite{toshniwal2014storm}、LinkedIn Samza\cite{noghabi2017samza} 等工业系统实践，
+也从不同角度展示了大规模流处理管道的工程化经验。
 
-在连接器层面，动态数据接入已成为社区演进方向之一：消费侧 FLIP-246\cite{flip246} 等工作探索
-在运行期调整订阅集合；生产侧 FLIP-515\cite{flip515} 等提案讨论动态 Kafka Sink 的形态与语义。
-工业实践中有基于 Kafka 与 Flink 进行实时事件连接等案例\cite{saket2024kafkaflink}。
-总体来看，已有工作更多从“为什么需要动态化”与“消费端如何动态订阅”角度展开，而对生产端如何把
-“正则或模式驱动的 Topic 发现、逻辑 route 管理、底层 writer 复用、状态快照与 route 级提交”整体组织起来，
-公开实现和系统验证仍相对不足。尤其在本科毕业设计这一工程实现导向的任务中，
-把这些思想真正落地为可运行的代码原型，仍然具有明确的研究与实践空间。
-本课题即面向上述缺口，侧重 Sink 侧动态 Topic 发现、逻辑路由与多目标写入的实现与说明。
+这些工作证明，现代流处理框架已经具备长时间运行、状态管理和故障恢复能力。
+但它们的主要关注点通常位于计算框架内部，即算子调度、状态迁移、资源管理和运行时容错；
+对于外部系统连接器，尤其是 Sink 侧写入目标在运行期变化时的适配机制，讨论相对有限。
+Flink 官方 Kafka Connector 和统一 Sink API 为外部写入提供了标准接口\cite{flinkKafkaDocs,flinkUnifiedSink}，
+并支持 \id{AT_LEAST_ONCE} 与 \id{EXACTLY_ONCE} 等投递语义，但常规 Kafka Sink 仍要求在构建阶段绑定目标 Topic。
+这意味着 Flink 运行时已经具备支撑动态行为的状态与提交框架，
+但官方静态 Sink 使用方式尚未充分覆盖动态 Topic 发现、route 级 writer 管理和运行期目标切换。
+
+\subsection{开源数据接入项目与动态订阅实践}
+
+在开源生态中，Kafka Connect 提供了面向外部系统的数据集成框架，通过 source connector 和 sink connector
+把数据库、文件系统、搜索引擎等系统与 Kafka 连接起来\cite{kafkaConnectDocs}；
+Debezium 则基于数据库变更日志实现 CDC，并将表级变更持续写入 Kafka\cite{debeziumDocs}；
+Flink CDC 项目进一步把数据库变更捕获能力接入 Flink 生态，用于构建实时数据同步和实时数仓链路\cite{flinkCdcDocs}。
+这些项目的共同价值在于降低数据接入成本，使数据源或外部系统的变化能够以流的形式进入计算链路。
+
+但从本文关注的问题看，这些项目与动态 Kafka Sink 仍存在明显差异。
+Kafka Connect 和 Debezium 更强调“外部系统到 Kafka”或“Kafka 到外部系统”的通用集成，
+其动态性多体现在任务配置、表捕获范围或 connector 实例管理上；Flink CDC 重点解决数据库表结构和变更日志进入 Flink 的问题。
+它们并不直接面向“一个正在运行的 Flink Kafka Sink 根据 Kafka Topic 元数据变化自动扩展写入目标”
+这一场景，也不需要在同一个 Flink Sink writer 内部处理多物理 Topic 的懒创建、状态封装和 route 级提交。
+因此，开源项目提供了数据接入工程化的重要参照，却不能替代本文所需的 Sink 侧动态写入机制。
+
+\subsection{动态 Topic 订阅与动态 Sink 相关工作}
+
+在 Flink 连接器演进中，动态 Topic 已经成为明确方向。FLIP-246 提出了 Dynamic Kafka Source，
+目标是在 Source 侧支持基于模式的 Kafka Topic 动态发现，并在运行期调整订阅集合\cite{flip246}。
+这一工作与本文最接近之处在于都依赖 Kafka 元数据发现和正则匹配；
+但 Source 侧的核心问题是分区发现、分区分配和消费进度管理，而 Sink 侧面对的是 producer 创建、
+目标 Topic 绑定、写入 fan-out、底层 writer 生命周期、事务提交与恢复状态组织，两者的状态语义和失败边界并不相同。
+
+生产端方向上，FLIP-515 已经开始讨论 Dynamic Kafka Sink 的必要性与接口形态\cite{flip515}。
+这说明社区已经意识到动态写入目标并非简单配置项，而是需要在 Sink 层单独建模的问题。
+不过，从公开资料看，相关讨论更多停留在设计提案与能力方向层面，
+对“如何在一个可运行原型中组织正则 Topic 发现、逻辑 route 到物理 Topic 的映射、多 writer 复用、
+Checkpoint 状态快照以及 \id{EXACTLY_ONCE} 事务路径”的完整实现与实验验证仍较有限。
+工业实践中也有 Kafka 与 Flink 组合进行实时事件处理的案例\cite{saket2024kafkaflink}，
+但其关注重点通常是流式计算逻辑和事件关联，而不是 Sink 端目标集合的运行期动态变化。
+
+\subsection{现有工作不足与本文问题引出}
+
+综上，现有研究和开源项目已经分别在四个层面提供了基础：Kafka 研究提升了消息系统本身的性能与可靠性；
+Flink 研究提供了有状态流处理、Checkpoint 与 Sink API 等运行时基础；
+Kafka Connect、Debezium 和 Flink CDC 等项目证明了数据接入工程化的重要性；
+FLIP-246 与 FLIP-515 则直接表明动态 Topic 发现和动态 Sink 是社区正在关注的方向。
+但是，这些工作与本文的应用背景仍存在关键差异：本文面对的是长期运行的 Flink 作业在 Sink 侧持续写入 Kafka，
+且目标 Topic 会随业务或运维变化而动态出现、调整或扩展。
+在该场景下，仅有 Kafka 元数据访问能力不够，仅有 Source 侧动态订阅机制不够，
+仅有静态 Kafka Sink 或外部 connector 管理框架也不够。
+
+因此，本文需要解决的核心问题可以归纳为：如何在不修改 Flink 运行时的前提下，
+基于统一 Sink API 设计并实现一套 Kafka Sink 侧动态 Topic 发现与订阅机制，
+使作业能够在运行期感知目标变化、维护逻辑 route 与物理 Topic 的映射、
+按 route 管理底层 writer 与状态，并尽可能复用既有 KafkaSink 的写入与提交能力。
+这一问题正是后续需求分析、系统设计和实验验证的出发点，
+也避免了先假设“必须实现动态 Sink”再寻找理由的逻辑倒置。
 
 \section{本文主要研究内容}
 
@@ -103,10 +151,10 @@ LinkedIn 上有状态的 Samza\cite{noghabi2017samza}等，为流式管道工程
   \item 分析现有基于统一 Sink API 的 Kafka Sink 在 Topic 与生产者管理上的静态性局限\cite{flinkUnifiedSink,flinkKafkaDocs}；
   \item 设计基于正则表达式的 Topic 模式、周期性元数据扫描与差异计算，形成发现—更新闭环；
   \item 提出逻辑路由与物理路由分离的映射模型，结合广播状态支持运行期路由更新；
-  \item 基于现有代码实现 \texttt{DynamicKafkaSink}、\texttt{DynamicKafkaSinkWriter}、\texttt{SingleClusterTopicMetadataService}、
-        \texttt{DynamicKafkaSinkWriterState}、\texttt{DynamicKafkaCommittable} 与 \texttt{DynamicKafkaCommitter} 等
+  \item 基于现有代码实现 \id{DynamicKafkaSink}、\id{DynamicKafkaSinkWriter}、\id{SingleClusterTopicMetadataService}、
+        \id{DynamicKafkaSinkWriterState}、\id{DynamicKafkaCommittable} 与 \id{DynamicKafkaCommitter} 等
         连接器核心组件，完成动态 route 管理、状态恢复与提交链路；
-  \item 以 \texttt{app} 模块作为实验载体，对 connector 暴露出的动态发现、显式 route 更新与静态基线能力进行验证，
+  \item 以 \id{app} 模块作为实验载体，对 connector 暴露出的动态发现、显式 route 更新与静态基线能力进行验证，
         并据此分析当前实现的能力边界与后续优化方向。
 \end{enumerate}
 
